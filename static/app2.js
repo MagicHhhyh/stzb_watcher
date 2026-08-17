@@ -1634,6 +1634,8 @@ function renderPlayerBattleTeams(rows){
     const heroStars=item.hero_stars||[0,0,0];
     const skillIds=(item.skills||'').split(',').filter(Boolean);
     const heroLevels=(item.hero_levels||'').split(',').map(l=>Number(l)||0);
+    const heroIdsStr = heroIds.join(','); // 直接传英雄ID
+    const side = item.side || 'atk';
     const heroHtml=heroIds.map((hid,hi)=>{
       let name=hid;
       if(typeof HERO_CFG!=='undefined'&&HERO_CFG[hid])name=HERO_CFG[hid].name||hid;
@@ -1657,7 +1659,7 @@ function renderPlayerBattleTeams(rows){
       selected:false,
       isStale:Boolean(item.isStale),
     });
-    return `<tr class='organization-row' data-selected='false' data-state='${item.isStale?'stale':'current'}'>
+    return `<tr class='organization-row' data-selected='false' data-state='${item.isStale?'stale':'current'}' onclick='showTeamDetails("${esc(item.player_name||'')}", "${side}", "${esc(heroIdsStr)}")' style='cursor:pointer' title='点击查看该队伍的详细战报'>
       <td style='color:var(--text2);font-size:.72rem;padding-left:22px'>${rank}</td>
       <td style='color:var(--text2);font-size:.72rem'>└ 队伍</td>
       <td><span class='hud-status-chip'>明细</span></td>
@@ -3321,8 +3323,9 @@ async function loadHeroCombo(){
     const wr = r.win_rate;
     const barColor = wr>=70?'var(--green)':wr>=50?'var(--gold)':'var(--red)';
     const heroes = r.combo.split('+').map(h=>`<span class='hud-status-chip'>${esc(h)}</span>`).join('');
+    const heroesForQuery = r.combo.replace(/\+/g, ',');
     const rankTier=i<3?'top':'standard';
-    return `<tr class='analysis-row' data-rank-tier='${rankTier}'>
+    return `<tr class='analysis-row' data-rank-tier='${rankTier}' onclick='showTeamDetails("", "atk", "${esc(heroesForQuery)}")' style='cursor:pointer' title='点击查看该阵容的详细战报'>
       <td><span class='analysis-rank' data-rank='${i+1}'>${i+1}</span></td>
       <td style='max-width:280px'><div class='analysis-evidence-row'>${heroes}</div></td>
       <td style='font-family:Share Tech Mono,monospace'>${r.total}</td>
@@ -5297,3 +5300,198 @@ function onMsg834(evt){
   }
 }
 */
+
+// ===== 队伍详细战报弹窗 =====
+let _teamDetailsModal = null;
+let _teamDetailsView = 'battles'; // 'battles' or 'matchups'
+
+async function showTeamDetails(playerName, side, heroesStr) {
+  if (!_teamDetailsModal) {
+    _teamDetailsModal = document.createElement('div');
+    _teamDetailsModal.id = 'team-details-modal';
+    _teamDetailsModal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+    _teamDetailsModal.innerHTML = `
+      <div style='background:var(--panel);border:1px solid var(--border);border-radius:8px;max-width:1200px;width:100%;max-height:90vh;display:flex;flex-direction:column'>
+        <div style='padding:20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center'>
+          <h3 id='td-title' style='margin:0;color:var(--gold)'>队伍详情</h3>
+          <button onclick='closeTeamDetails()' style='background:none;border:none;color:var(--text2);font-size:24px;cursor:pointer;padding:0 10px'>&times;</button>
+        </div>
+        <div style='padding:15px 20px;border-bottom:1px solid var(--border);display:flex;gap:10px'>
+          <button id='td-btn-battles' class='btn btn-primary' onclick='switchTeamDetailsView("battles")'>战报列表</button>
+          <button id='td-btn-matchups' class='btn' onclick='switchTeamDetailsView("matchups")'>对阵统计</button>
+        </div>
+        <div id='td-content' style='flex:1;overflow:auto;padding:20px'></div>
+      </div>
+    `;
+    document.body.appendChild(_teamDetailsModal);
+    _teamDetailsModal.onclick = (e) => {
+      if (e.target === _teamDetailsModal) closeTeamDetails();
+    };
+  }
+
+  _teamDetailsModal.style.display = 'flex';
+  _teamDetailsView = 'battles';
+  document.getElementById('td-btn-battles').className = 'btn btn-primary';
+  document.getElementById('td-btn-matchups').className = 'btn';
+
+  const heroesArr = heroesStr.split(',');
+  // 将英雄ID转换为名字显示
+  const heroesDisplay = heroesArr.map(hid => {
+    let name = hid;
+    if (typeof HERO_CFG !== 'undefined' && HERO_CFG[hid]) {
+      name = HERO_CFG[hid].name || hid;
+    }
+    return `<span style='background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:2px 8px;margin:0 3px'>${esc(name)}</span>`;
+  }).join('');
+
+  // 如果有玩家名，显示"玩家名 - 阵容"；否则只显示"阵容详情"
+  if (playerName) {
+    document.getElementById('td-title').innerHTML = `${esc(playerName)} - ${heroesDisplay}`;
+  } else {
+    document.getElementById('td-title').innerHTML = `阵容详情 - ${heroesDisplay}`;
+  }
+
+  document.getElementById('td-content').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text2)">加载中...</div>';
+
+  const url = `/api/team_battle_details?player=${encodeURIComponent(playerName)}&side=${side}&heroes=${encodeURIComponent(heroesStr)}`;
+  console.log('[showTeamDetails] Request URL:', url);
+  console.log('[showTeamDetails] Params:', {playerName, side, heroesStr});
+
+  const data = await apiFetch(url);
+  console.log('[showTeamDetails] Response data:', data);
+
+  if (!data || data.error) {
+    document.getElementById('td-content').innerHTML = `<div style="text-align:center;padding:40px;color:var(--red)">加载失败: ${data?.error || '未知错误'}</div>`;
+    return;
+  }
+
+  window._teamDetailsData = data;
+  renderTeamDetails();
+}
+
+function switchTeamDetailsView(view) {
+  _teamDetailsView = view;
+  document.getElementById('td-btn-battles').className = view === 'battles' ? 'btn btn-primary' : 'btn';
+  document.getElementById('td-btn-matchups').className = view === 'matchups' ? 'btn btn-primary' : 'btn';
+  renderTeamDetails();
+}
+
+function renderTeamDetails() {
+  const data = window._teamDetailsData;
+  if (!data) return;
+
+  const content = document.getElementById('td-content');
+
+  if (_teamDetailsView === 'battles') {
+    // 战报列表视图
+    if (!data.battles || data.battles.length === 0) {
+      content.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text2)">暂无战报数据</div>';
+      return;
+    }
+
+    content.innerHTML = `
+      <div style='margin-bottom:15px;color:var(--text2)'>共 ${data.total_battles} 场战斗</div>
+      <table class='data-table' style='width:100%'>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>结果</th>
+            <th>战斗类型</th>
+            <th>攻方</th>
+            <th>守方</th>
+            <th>地块</th>
+            <th>战报ID</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${data.battles.map(b => {
+            // 根据玩家视角显示结果
+            let resultText = '', resultColor = 'var(--text2)';
+            if (b.player_side) {
+              // result值定义：
+              // 0: 攻方败/守方胜, 1: 攻方胜/守方败, 2: 守方胜/攻方败
+              // 10: 平局, 15: 双溃
+              if (b.result === 10) {
+                resultText = '平局'; resultColor = 'var(--gold)';
+              } else if (b.result === 15) {
+                resultText = '双溃'; resultColor = 'var(--text2)';
+              } else if (b.player_side === 'atk') {
+                // 攻方视角：result=1,7,11 为胜，其他为负
+                if (b.result === 1 || b.result === 7 || b.result === 11) {
+                  resultText = '胜'; resultColor = 'var(--green)';
+                } else {
+                  resultText = '负'; resultColor = 'var(--red)';
+                }
+              } else {
+                // 守方视角：result=0,2,6,12 为胜，result=1 为负
+                if (b.result === 0 || b.result === 2 || b.result === 6 || b.result === 12) {
+                  resultText = '胜'; resultColor = 'var(--green)';
+                } else {
+                  resultText = '负'; resultColor = 'var(--red)';
+                }
+              }
+            } else {
+              resultColor = b.result in {1:1,7:1,11:1} ? 'var(--green)' : b.result in {2:1,6:1,12:1} ? 'var(--red)' : 'var(--text2)';
+              resultText = b.result_desc || '未知';
+            }
+            const fightTypeMap = {0:'野战', 33:'大城', 80:'攻城', 27:'宝物', 1:'援军', 2:'援军'};
+            return `<tr onclick='showBattleDetail(${b.battle_id})' style='cursor:pointer' title='点击查看战报详情'>
+              <td style='font-size:.72rem'>${esc(b.time_str||'')}</td>
+              <td style='color:${resultColor};font-weight:600'>${resultText}</td>
+              <td>${fightTypeMap[b.fight_type] || b.fight_type}</td>
+              <td><b>${esc(b.atk_name||'')}</b><br><span style='color:var(--text2);font-size:.68rem'>${esc(b.atk_union||'')}</span></td>
+              <td><b>${esc(b.def_name||'')}</b><br><span style='color:var(--text2);font-size:.68rem'>${esc(b.def_union||'')}</span></td>
+              <td style='font-family:Share Tech Mono,monospace;font-size:.72rem'>${esc(b.wid_code||'')}</td>
+              <td style='font-family:Share Tech Mono,monospace;color:var(--cyan)'>${b.battle_id}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  } else {
+    // 对阵统计视图
+    if (!data.matchups || data.matchups.length === 0) {
+      content.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text2)">暂无对阵数据</div>';
+      return;
+    }
+
+    content.innerHTML = `
+      <div style='margin-bottom:15px;color:var(--text2)'>共对阵 ${data.matchups.length} 种队伍组合</div>
+      <table class='data-table' style='width:100%'>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>对方阵容</th>
+            <th>交手</th>
+            <th>胜</th>
+            <th>平</th>
+            <th>负</th>
+            <th>胜率</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${data.matchups.map((m, i) => {
+            const wrColor = m.win_rate >= 60 ? 'var(--green)' : m.win_rate >= 40 ? 'var(--gold)' : 'var(--red)';
+            const heroesArr = (m.opp_heroes||'').split(',').filter(Boolean);
+            const heroesDisplay = heroesArr.map(h => `<span style='background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:1px 6px;font-size:.68rem;margin:1px'>${esc(h)}</span>`).join('');
+            return `<tr>
+              <td style='color:var(--text2)'>${i+1}</td>
+              <td>${heroesDisplay || '—'}</td>
+              <td style='font-family:Share Tech Mono,monospace'>${m.total}</td>
+              <td style='color:var(--green)'>${m.wins}</td>
+              <td style='color:var(--text2)'>${m.draws}</td>
+              <td style='color:var(--red)'>${m.loses}</td>
+              <td style='color:${wrColor};font-weight:600'>${m.win_rate}%</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+}
+
+function closeTeamDetails() {
+  if (_teamDetailsModal) {
+    _teamDetailsModal.style.display = 'none';
+  }
+}

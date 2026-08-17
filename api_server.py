@@ -2272,6 +2272,219 @@ def api_player_teams_stats():
     return jsonify(data[:limit])
 
 
+# ===== 队伍详细战报和对阵统计 =====
+@app.route('/api/team_battle_details')
+def api_team_battle_details():
+    """获取特定队伍的详细战报和对阵统计"""
+    try:
+        print("[team_battle_details] API called!")
+        player = request.args.get('player', '')
+        side = request.args.get('side', '')  # atk/def
+        heroes = request.args.get('heroes', '')  # 英雄ID字符串，逗号或+分隔
+        print(f"[team_battle_details] Raw params: player={player}, side={side}, heroes={heroes}")
+
+        if not side or not heroes:
+            print(f"[team_battle_details] Missing params!")
+            return jsonify({'error': '参数不完整'}), 400
+
+        print(f"[team_battle_details] Using database: {_current_db_path}")
+        conn = get_db()
+
+        # 标准化英雄ID列表（支持+或,分隔）
+        hero_ids = heroes.replace('+', ',').split(',')
+        hero_ids = [h.strip() for h in hero_ids if h.strip()]
+
+        # 构建 parse_hero_info 函数（和统计接口保持一致）
+        def parse_hero_info(s):
+            if not s: return ''
+            heroes = []
+            for seg in s.split(';'):
+                parts = seg.split(',')
+                if parts and parts[0].strip().isdigit():
+                    heroes.append(parts[0].strip())
+            return '+'.join(heroes)
+
+        # 构建查询条件
+        # 不再限制攻守方，查询该玩家使用这个阵容的所有战报
+        if player:
+            base_where = "(atk_name=? OR def_name=?)"
+            params = [player, player]
+        else:
+            base_where = "1=1"
+            params = []
+
+        # 添加过滤条件，与统计接口保持一致
+        bv_cols = get_bv2_cols(conn)
+        base_where += " AND result != 6"
+        if 'is_npc' in bv_cols:
+            base_where += " AND COALESCE(is_npc, 0) = 0"
+        if 'isnpc' in bv_cols:
+            base_where += " AND COALESCE(isnpc, 0) = 0"
+
+        # 从battles_v2查询
+        rows = conn.execute(f'''
+            SELECT battle_id, time_str, result, result_desc,
+                   atk_name, atk_union, def_name, def_union,
+                   fight_type, wid_code,
+                   attack_all_hero_info, defend_all_hero_info,
+                   atk_hero1_id, atk_hero2_id, atk_hero3_id,
+                   def_hero1_id, def_hero2_id, def_hero3_id
+            FROM battles_v2
+            WHERE {base_where}
+            ORDER BY battle_id DESC
+            LIMIT 50000
+        ''', params).fetchall()
+
+        matched_battles = []
+        target_ids_str = '+'.join(hero_ids)
+        debug_info = {'target': target_ids_str, 'total_rows': len(rows), 'samples': []}
+
+        print(f"[team_battle_details] player={player}, side={side}, target_ids={target_ids_str}")
+        print(f"[team_battle_details] Found {len(rows)} total rows")
+
+        # 打印前3个战报的详细信息
+        sample_count = 0
+        for r in rows:
+            # 判断该战报中玩家的实际角色
+            player_actual_side = None
+            if player:
+                if r['atk_name'] == player:
+                    player_actual_side = 'atk'
+                elif r['def_name'] == player:
+                    player_actual_side = 'def'
+            else:
+                # 如果没有指定玩家，使用传入的side参数
+                player_actual_side = side
+
+            # 根据玩家实际角色解析英雄ID
+            if player_actual_side == 'atk':
+                atk_hero_info = r['attack_all_hero_info'] or ''
+                heroes_ids = parse_hero_info(atk_hero_info)
+                if not heroes_ids:
+                    ah1, ah2, ah3 = r['atk_hero1_id'] or 0, r['atk_hero2_id'] or 0, r['atk_hero3_id'] or 0
+                    heroes_ids = '+'.join(str(x) for x in [ah1, ah2, ah3] if x)
+            else:
+                def_hero_info = r['defend_all_hero_info'] or ''
+                heroes_ids = parse_hero_info(def_hero_info)
+                if not heroes_ids:
+                    dh1, dh2, dh3 = r['def_hero1_id'] or 0, r['def_hero2_id'] or 0, r['def_hero3_id'] or 0
+                    heroes_ids = '+'.join(str(x) for x in [dh1, dh2, dh3] if x)
+
+            # 记录前几条用于调试
+            if len(debug_info['samples']) < 5:
+                debug_info['samples'].append({
+                    'battle_id': r['battle_id'],
+                    'heroes_ids': heroes_ids,
+                    'match': heroes_ids == target_ids_str
+                })
+                if sample_count < 3:
+                    print(f"[team_battle_details] Sample {sample_count}: battle_id={r['battle_id']}, heroes_ids='{heroes_ids}', target='{target_ids_str}', match={heroes_ids == target_ids_str}")
+                    sample_count += 1
+
+            # 匹配英雄ID组合（字符串比较）
+            if heroes_ids == target_ids_str:
+                matched_battles.append({
+                    'battle_id': r['battle_id'],
+                    'time_str': r['time_str'],
+                    'result': r['result'],
+                    'result_desc': r['result_desc'],
+                    'atk_name': r['atk_name'],
+                    'atk_union': r['atk_union'],
+                    'def_name': r['def_name'],
+                    'def_union': r['def_union'],
+                    'fight_type': r['fight_type'],
+                    'wid_code': r['wid_code'],
+                    'player_side': player_actual_side,  # 使用实际角色而不是传入的side参数
+                })
+
+        # 统计对阵情况
+        from collections import defaultdict
+        matchup_stats = defaultdict(lambda: {'total': 0, 'wins': 0, 'draws': 0})
+
+        for battle in matched_battles:
+            bid = battle['battle_id']
+            result = battle['result']
+            player_side = battle['player_side']  # 使用战报中玩家的实际角色
+
+            # 判断胜负（根据玩家的实际角色）
+            if player_side == 'atk':
+                opp_name = battle['def_name']
+                is_win = result in (1, 7, 11)
+            else:
+                opp_name = battle['atk_name']
+                is_win = result in (2, 6, 12)
+
+            is_draw = result not in (1, 2, 6, 7, 11, 12)
+
+            # 获取对方英雄ID
+            opp_row = conn.execute('''
+                SELECT attack_all_hero_info, defend_all_hero_info,
+                       atk_hero1_id, atk_hero2_id, atk_hero3_id,
+                       def_hero1_id, def_hero2_id, def_hero3_id
+                FROM battles_v2
+                WHERE battle_id=?
+            ''', (bid,)).fetchone()
+
+            if opp_row:
+                if player_side == 'atk':
+                    opp_hero_info = opp_row['defend_all_hero_info'] or ''
+                    opp_heroes_ids = parse_hero_info(opp_hero_info)
+                    if not opp_heroes_ids:
+                        dh1, dh2, dh3 = opp_row['def_hero1_id'] or 0, opp_row['def_hero2_id'] or 0, opp_row['def_hero3_id'] or 0
+                        opp_heroes_ids = '+'.join(str(x) for x in [dh1, dh2, dh3] if x)
+                else:
+                    opp_hero_info = opp_row['attack_all_hero_info'] or ''
+                    opp_heroes_ids = parse_hero_info(opp_hero_info)
+                    if not opp_heroes_ids:
+                        ah1, ah2, ah3 = opp_row['atk_hero1_id'] or 0, opp_row['atk_hero2_id'] or 0, opp_row['atk_hero3_id'] or 0
+                        opp_heroes_ids = '+'.join(str(x) for x in [ah1, ah2, ah3] if x)
+
+                key = (opp_name, opp_heroes_ids)
+                matchup_stats[key]['total'] += 1
+                if is_win:
+                    matchup_stats[key]['wins'] += 1
+                elif is_draw:
+                    matchup_stats[key]['draws'] += 1
+
+        conn.close()
+
+        # 转换对阵统计为列表
+        matchup_list = []
+        for (opp_name, opp_heroes_str), stats in matchup_stats.items():
+            total = stats['total']
+            wins = stats['wins']
+            draws = stats['draws']
+            loses = total - wins - draws
+            win_rate = round((wins + draws * 0.5) / total * 100, 1) if total > 0 else 0
+
+            matchup_list.append({
+                'opp_name': opp_name,
+                'opp_heroes': opp_heroes_str,
+                'total': total,
+                'wins': wins,
+                'draws': draws,
+                'loses': loses,
+                'win_rate': win_rate,
+            })
+
+        matchup_list.sort(key=lambda x: (-x['total'], -x['win_rate']))
+
+        print(f"[team_battle_details] Returning {len(matched_battles)} battles, {len(matchup_list)} matchups")
+
+        return jsonify({
+            'battles': matched_battles,
+            'matchups': matchup_list,
+            'total_battles': len(matched_battles),
+            'debug': debug_info,
+        })
+
+    except Exception as e:
+        print(f"[team_battle_details] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'battles': [], 'matchups': [], 'total_battles': 0}), 500
+
+
 # ===== 玩家队伍统计（直接从battles_v2解析红度+技能） =====
 @app.route('/api/player_battle_teams')
 def api_player_battle_teams():
