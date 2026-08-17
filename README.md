@@ -184,7 +184,7 @@ Android 一级导航为“战场、队伍、团队、模拟、更多”，以移
 ### Windows 普通用户
 
 如果你使用 Windows，不需要安装 Python 或配置开发环境，可以直接使用 Release 中的 EXE：
-
+0. 下载npcap服务。https://npcap.com/
 1. 打开项目的 [Releases 页面](https://github.com/GRQ02200059/stzb_watcher/releases)。
 2. 进入最新版本，展开 `Assets`。
 3. 下载文件名以 `.exe` 结尾的 Windows 程序。
