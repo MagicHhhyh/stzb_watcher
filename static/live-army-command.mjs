@@ -19,15 +19,22 @@ const STATE_COLORS = Object.freeze({
   unknown: "#c98555",
 });
 
-export function filterArmies(armies, query = "", stateFilter = "all") {
+export function filterArmies(armies, query = "", stateFilter = "all", unionFilter = "all") {
   const normalizedQuery = normalizeSearch(query);
   const normalizedFilter = String(stateFilter || "all");
+  const normalizedUnionFilter = String(unionFilter || "all");
   return (armies || []).filter((army) => {
     if (
       normalizedFilter !== "all"
       && String(army?.stateKey || "unknown") !== normalizedFilter
     ) {
       return false;
+    }
+    if (normalizedUnionFilter !== "all") {
+      const unionName = armyUnionName(army);
+      if (unionName !== normalizedUnionFilter) {
+        return false;
+      }
     }
     if (!normalizedQuery) return true;
     return normalizeSearch(searchTextForArmy(army)).includes(
@@ -137,6 +144,7 @@ export function createLiveArmyCommand({
     query: "",
     stateFilter: "all",
     timeFilter: "10",
+    unionFilter: "all",
     activeTab: initialTab,
     dirty: false,
     eventRevision: 0,
@@ -311,6 +319,7 @@ export function createLiveArmyCommand({
     query = state.query,
     stateFilter = state.stateFilter,
     timeFilter = state.timeFilter,
+    unionFilter = state.unionFilter,
   ) {
     if (query && typeof query === "object") {
       state.query = String(query.query ?? state.query);
@@ -320,20 +329,28 @@ export function createLiveArmyCommand({
       state.timeFilter = String(
         query.timeFilter ?? query.time ?? state.timeFilter,
       );
+      state.unionFilter = String(
+        query.unionFilter ?? query.union ?? state.unionFilter,
+      );
     } else {
       state.query = String(query ?? "");
       state.stateFilter = String(stateFilter || "all");
       state.timeFilter = String(timeFilter || "10");
+      state.unionFilter = String(unionFilter || "all");
     }
     const search = element("live-army-search");
     const select = element("live-army-status-filter");
     const timeSelect = element("live-army-time-filter");
+    const unionSelect = element("live-army-union-filter");
     if (search && search.value !== state.query) search.value = state.query;
     if (select && select.value !== state.stateFilter) {
       select.value = state.stateFilter;
     }
     if (timeSelect && timeSelect.value !== state.timeFilter) {
       timeSelect.value = state.timeFilter;
+    }
+    if (unionSelect && unionSelect.value !== state.unionFilter) {
+      unionSelect.value = state.unionFilter;
     }
     const filteredSnapshot = visibleSnapshot();
     if (!findArmy(filteredSnapshot, state.selectedArmyId)) {
@@ -376,6 +393,18 @@ export function createLiveArmyCommand({
           state.query,
           state.stateFilter,
           event.target?.value || "10",
+          state.unionFilter,
+        );
+      },
+    );
+    element("live-army-union-filter")?.addEventListener?.(
+      "change",
+      (event) => {
+        setFilter(
+          state.query,
+          state.stateFilter,
+          state.timeFilter,
+          event.target?.value || "all",
         );
       },
     );
@@ -578,10 +607,47 @@ export function createLiveArmyCommand({
     if (!state.snapshot) return;
     renderFreshness();
     renderSummary();
+    renderUnionFilter();
     renderLists();
     renderMap();
     renderDetail();
     updateActionState();
+  }
+
+  function renderUnionFilter() {
+    const unionSelect = element("live-army-union-filter");
+    if (!unionSelect) return;
+
+    // 从所有部队中提取同盟
+    const unions = new Set();
+    const allArmies = [
+      ...(state.snapshot?.current || []),
+      ...(state.snapshot?.offline || [])
+    ];
+
+    allArmies.forEach(army => {
+      const unionName = armyUnionName(army);
+      if (unionName && unionName !== "未知同盟") {
+        unions.add(unionName);
+      }
+    });
+
+    // 保存当前选中值
+    const currentValue = unionSelect.value || "all";
+
+    // 清空并重新填充选项
+    unionSelect.innerHTML = '<option value="all">全部同盟</option>';
+    [...unions].sort().forEach(union => {
+      const option = documentRef.createElement("option");
+      option.value = union;
+      option.textContent = union;
+      unionSelect.appendChild(option);
+    });
+
+    // 恢复选中值
+    if ([...unionSelect.options].some(opt => opt.value === currentValue)) {
+      unionSelect.value = currentValue;
+    }
   }
 
   function renderFreshness() {
@@ -1133,6 +1199,7 @@ export function createLiveArmyCommand({
           state.snapshot?.current || [],
           state.query,
           state.stateFilter,
+          state.unionFilter,
         ),
         state.timeFilter,
         state.nowMs,
@@ -1144,6 +1211,7 @@ export function createLiveArmyCommand({
         state.snapshot?.recentOffline || [],
         state.query,
         state.stateFilter,
+        state.unionFilter,
       ),
       state.timeFilter,
       state.nowMs,

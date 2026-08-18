@@ -2234,17 +2234,20 @@ def api_player_teams_stats():
         battle_heroes_map[k].append((pos, hname))
         battle_meta[k] = (union_n or '', result)
 
-    # 聚合队伍
-    team_stats = defaultdict(lambda: {'used_count':0,'win_count':0,'draw_count':0,'union':'','side':''})
+    # 聚合队伍（攻防合并）
+    team_stats = defaultdict(lambda: {'used_count':0,'win_count':0,'draw_count':0,'union':'','sides':set(),'max_battle_id':0})
     for (pname, sd, bid), heroes in battle_heroes_map.items():
         heroes.sort(key=lambda x: x[0])
         heroes_str = ','.join(h[1] for h in heroes if h[1])
         if not heroes_str: continue
         union_n, result = battle_meta[(pname, sd, bid)]
-        key = (pname, sd, heroes_str)
+        key = (pname, heroes_str)  # 不再包含side，攻防合并
         team_stats[key]['used_count'] += 1
-        team_stats[key]['union'] = union_n
-        team_stats[key]['side'] = sd
+        team_stats[key]['sides'].add(sd)
+        # 记录最新战报（battle_id最大）的联盟
+        if bid > team_stats[key]['max_battle_id']:
+            team_stats[key]['max_battle_id'] = bid
+            team_stats[key]['union'] = union_n
         # 攻方胜：result in (1,7,11)；守方胜：result in (2,6,12)；其余按平局算 0.5 胜
         if sd == 'atk' and result in (1,7,11):
             team_stats[key]['win_count'] += 1
@@ -2254,14 +2257,20 @@ def api_player_teams_stats():
             team_stats[key]['draw_count'] += 1
 
     data = []
-    for (pname, sd, heroes_str), stat in team_stats.items():
+    for (pname, heroes_str), stat in team_stats.items():
         uc = stat['used_count']
         wc = stat['win_count']
         dc = stat['draw_count']
+        # 生成side标识：如果攻防都有则显示'both'，否则显示单一方向
+        sides = stat['sides']
+        if len(sides) == 2:
+            side_display = 'both'
+        else:
+            side_display = list(sides)[0]
         data.append({
             'player_name': pname,
             'union_name': stat['union'],
-            'side': sd,
+            'side': side_display,
             'heroes_str': heroes_str,
             'used_count': uc,
             'win_count': wc,
@@ -2431,13 +2440,13 @@ def api_team_battle_details():
                     opp_heroes_ids = parse_hero_info(opp_hero_info)
                     if not opp_heroes_ids:
                         dh1, dh2, dh3 = opp_row['def_hero1_id'] or 0, opp_row['def_hero2_id'] or 0, opp_row['def_hero3_id'] or 0
-                        opp_heroes_ids = '+'.join(str(x) for x in [dh1, dh2, dh3] if x)
+                        opp_heroes_ids = '+'.join(str(x) for x in [dh1, dh2, dh3] if x and x != 0)
                 else:
                     opp_hero_info = opp_row['attack_all_hero_info'] or ''
                     opp_heroes_ids = parse_hero_info(opp_hero_info)
                     if not opp_heroes_ids:
                         ah1, ah2, ah3 = opp_row['atk_hero1_id'] or 0, opp_row['atk_hero2_id'] or 0, opp_row['atk_hero3_id'] or 0
-                        opp_heroes_ids = '+'.join(str(x) for x in [ah1, ah2, ah3] if x)
+                        opp_heroes_ids = '+'.join(str(x) for x in [ah1, ah2, ah3] if x and x != 0)
 
                 key = (opp_name, opp_heroes_ids)
                 matchup_stats[key]['total'] += 1
@@ -2511,41 +2520,94 @@ def api_player_battle_teams():
     conn = get_db()
     bv_cols = get_bv2_cols(conn)
 
-    conds = ["1=1"]
-    params = []
-    if player:
-        conds.append("(atk_name LIKE ? OR def_name LIKE ?)")
-        params += [f'%{player}%', f'%{player}%']
-    if union:
-        conds.append("(atk_union LIKE ? OR def_union LIKE ?)")
-        params += [f'%{union}%', f'%{union}%']
-
     # 先按 NPC 过滤查询；若结果为空，再回退为不过滤（用于排查 is_npc/isnpc 字段不一致问题）
-    conds_npc = list(conds)
-    conds_npc.append('result != 6')
+    conds_npc = ['result != 6']
     if 'is_npc' in bv_cols:
         conds_npc.append('COALESCE(is_npc, 0) = 0')
     if 'isnpc' in bv_cols:
         conds_npc.append('COALESCE(isnpc, 0) = 0')
 
     where = ' AND '.join(conds_npc)
-    rows = conn.execute(f'''
-        SELECT *
-        FROM battles_v2
-        WHERE {where}
-        ORDER BY battle_id DESC
-        LIMIT 50000
-    ''', params).fetchall()
 
-    if not rows:
-        where_fallback = ' AND '.join(conds)
+    # 如果指定了玩家名或联盟，先筛选出符合条件的玩家列表
+    target_players = set()
+    if player or union:
+        filter_conds = [where]
+        filter_params = []
+        if player:
+            filter_conds.append("(atk_name LIKE ? OR def_name LIKE ?)")
+            filter_params += [f'%{player}%', f'%{player}%']
+        if union:
+            filter_conds.append("(atk_union LIKE ? OR def_union LIKE ?)")
+            filter_params += [f'%{union}%', f'%{union}%']
+
+        filter_where = ' AND '.join(filter_conds)
+        player_rows = conn.execute(f'''
+            SELECT DISTINCT atk_name, def_name
+            FROM battles_v2
+            WHERE {filter_where}
+            LIMIT 50000
+        ''', filter_params).fetchall()
+
+        for row in player_rows:
+            atk = (row[0] or '').strip()
+            def_n = (row[1] or '').strip()
+            if atk:
+                # 检查攻方是否匹配玩家名过滤
+                if not player or player.lower() in atk.lower():
+                    target_players.add(atk)
+            if def_n:
+                # 检查守方是否匹配玩家名过滤
+                if not player or player.lower() in def_n.lower():
+                    target_players.add(def_n)
+
+        if not target_players:
+            conn.close()
+            cache_data[cache_key] = {'ts': now, 'result': []}
+            return jsonify([])
+
+    # 查询这些玩家的所有战报
+    if target_players:
+        # 构建 IN 查询
+        placeholders = ','.join(['?'] * len(target_players))
         rows = conn.execute(f'''
             SELECT *
             FROM battles_v2
-            WHERE {where_fallback}
-        ORDER BY battle_id DESC
-        LIMIT 50000
-    ''', params).fetchall()
+            WHERE {where}
+              AND (atk_name IN ({placeholders}) OR def_name IN ({placeholders}))
+            ORDER BY battle_id DESC
+            LIMIT 50000
+        ''', list(target_players) * 2).fetchall()
+    else:
+        # 没有玩家/联盟过滤，返回所有
+        rows = conn.execute(f'''
+            SELECT *
+            FROM battles_v2
+            WHERE {where}
+            ORDER BY battle_id DESC
+            LIMIT 50000
+        ''').fetchall()
+
+    if not rows:
+        where_fallback = '1=1'
+        if target_players:
+            placeholders = ','.join(['?'] * len(target_players))
+            rows = conn.execute(f'''
+                SELECT *
+                FROM battles_v2
+                WHERE {where_fallback}
+                  AND (atk_name IN ({placeholders}) OR def_name IN ({placeholders}))
+                ORDER BY battle_id DESC
+                LIMIT 50000
+            ''', list(target_players) * 2).fetchall()
+        else:
+            rows = conn.execute(f'''
+                SELECT *
+                FROM battles_v2
+                WHERE {where_fallback}
+                ORDER BY battle_id DESC
+                LIMIT 50000
+            ''').fetchall()
     conn.close()
 
     from collections import defaultdict
@@ -2588,10 +2650,11 @@ def api_player_battle_teams():
         return ','.join(str(x) for x in result_skills if x)
 
     # key: (player_name, uid, heroes_key) -> stats
-    team_map = defaultdict(lambda: {'cnt':0,'wins':0,'draws':0,'union':'','uid':'','hero_stars':[0,0,0],'skills':'','heroes_str':'','clan_name':'','max_troops':0})
+    team_map = defaultdict(lambda: {'cnt':0,'wins':0,'draws':0,'union':'','uid':'','hero_stars':[0,0,0],'skills':'','heroes_str':'','clan_name':'','max_troops':0,'max_battle_id':0})
 
     for row in rows:
         r = dict(row)
+        battle_id = r.get('battle_id', 0)
         atk_name = r.get('atk_name', '')
         atk_uid = r.get('atk_uid', '')
         atk_union = r.get('atk_union', '')
@@ -2607,52 +2670,68 @@ def api_player_battle_teams():
         def_advance = r.get('def_advance', '')
         atk_clan_name = r.get('attack_clan_name', '')
         def_clan_name = r.get('defend_clan_name', '')
-        atk_power = int(r.get('atk_power', 0) or 0)
+        atk_power = int(r.get('attack_hp', 0) or 0)  # 使用attack_hp作为攻方实际兵力
 
-        # 攻方
-        if side in ('', 'atk') and atk_name and atk_name.strip():
-            heroes_ids = parse_hero_info(atk_hero_info)
-            if not heroes_ids:
-                heroes_ids = '+'.join(str(x) for x in [ah1,ah2,ah3] if x)
-            if heroes_ids:
-                stars = parse_advance_stars(atk_advance)
-                skills = parse_skill_info(skill_info, [1,2,3])
-                k = (atk_name.strip(), str(atk_uid or ''), heroes_ids)
-                d = team_map[k]
-                d['cnt'] += 1
-                d['union'] = atk_union or ''
-                d['uid'] = str(atk_uid or '')
-                d['clan_name'] = atk_clan_name or ''
-                d['hero_stars'] = [max(d['hero_stars'][i], stars[i]) for i in range(3)]
-                d['skills'] = skills
-                d['heroes_str'] = heroes_ids
-                d['max_troops'] = max(d['max_troops'], atk_power)
-                if result in (1,7,11):
-                    d['wins'] += 1
-                elif result not in (1,2,6,7,11,12):
-                    d['draws'] += 1
+        # 攻方：只统计目标玩家的队伍
+        atk_name_stripped = atk_name.strip() if atk_name else ''
+        if side in ('', 'atk') and atk_name_stripped:
+            # 如果有目标玩家列表，只统计目标玩家
+            if target_players and atk_name_stripped not in target_players:
+                pass  # 跳过非目标玩家
+            else:
+                heroes_ids = parse_hero_info(atk_hero_info)
+                if not heroes_ids:
+                    heroes_ids = '+'.join(str(x) for x in [ah1,ah2,ah3] if x)
+                if heroes_ids:
+                    stars = parse_advance_stars(atk_advance)
+                    skills = parse_skill_info(skill_info, [1,2,3])
+                    k = (atk_name_stripped, str(atk_uid or ''), heroes_ids)
+                    d = team_map[k]
+                    d['cnt'] += 1
+                    # 使用最新战报（battle_id最大）的联盟
+                    if battle_id > d['max_battle_id']:
+                        d['max_battle_id'] = battle_id
+                        d['union'] = atk_union or ''
+                        d['clan_name'] = atk_clan_name or ''
+                    d['uid'] = str(atk_uid or '')
+                    d['hero_stars'] = [max(d['hero_stars'][i], stars[i]) for i in range(3)]
+                    d['skills'] = skills
+                    d['heroes_str'] = heroes_ids
+                    d['max_troops'] = max(d['max_troops'], atk_power)
+                    if result in (1,7,11):
+                        d['wins'] += 1
+                    elif result not in (1,2,6,7,11,12):
+                        d['draws'] += 1
 
-        # 守方
-        if side in ('', 'def') and def_name and def_name.strip():
-            heroes_ids = parse_hero_info(def_hero_info)
-            if not heroes_ids:
-                heroes_ids = '+'.join(str(x) for x in [dh1,dh2,dh3] if x)
-            if heroes_ids:
-                stars = parse_advance_stars(def_advance)
-                skills = parse_skill_info(skill_info, [6,5,4])
-                k = (def_name.strip(), '', heroes_ids)
-                d = team_map[k]
-                d['cnt'] += 1
-                d['union'] = def_union or ''
-                d['uid'] = ''
-                d['clan_name'] = def_clan_name or ''
-                d['hero_stars'] = [max(d['hero_stars'][i], stars[i]) for i in range(3)]
-                d['skills'] = skills
-                d['heroes_str'] = heroes_ids
-                if result in (2,6,12):
-                    d['wins'] += 1
-                elif result not in (1,2,6,7,11,12):
-                    d['draws'] += 1
+        # 守方：只统计目标玩家的队伍
+        def_name_stripped = def_name.strip() if def_name else ''
+        if side in ('', 'def') and def_name_stripped:
+            # 如果有目标玩家列表，只统计目标玩家
+            if target_players and def_name_stripped not in target_players:
+                pass  # 跳过非目标玩家
+            else:
+                heroes_ids = parse_hero_info(def_hero_info)
+                if not heroes_ids:
+                    heroes_ids = '+'.join(str(x) for x in [dh1,dh2,dh3] if x)
+                if heroes_ids:
+                    stars = parse_advance_stars(def_advance)
+                    skills = parse_skill_info(skill_info, [6,5,4])
+                    k = (def_name_stripped, '', heroes_ids)
+                    d = team_map[k]
+                    d['cnt'] += 1
+                    # 使用最新战报（battle_id最大）的联盟
+                    if battle_id > d['max_battle_id']:
+                        d['max_battle_id'] = battle_id
+                        d['union'] = def_union or ''
+                        d['clan_name'] = def_clan_name or ''
+                    d['uid'] = ''
+                    d['hero_stars'] = [max(d['hero_stars'][i], stars[i]) for i in range(3)]
+                    d['skills'] = skills
+                    d['heroes_str'] = heroes_ids
+                    if result in (2,6,12):
+                        d['wins'] += 1
+                    elif result not in (1,2,6,7,11,12):
+                        d['draws'] += 1
 
     data = []
     for (pname, uid, heroes_ids), stat in team_map.items():

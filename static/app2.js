@@ -1516,7 +1516,7 @@ function renderOrganizationLoadError(tbody, stateHost, state, colspan=8){
 }
 
 function expandAllPlayerBattleTeams(){
-  _pbtExpandedPlayers = new Set((_pbtCurrentRows||[]).map(r=>`${r.player_name||''}__${r.union||r.union_name||''}`).filter(Boolean));
+  _pbtExpandedPlayers = new Set((_pbtCurrentRows||[]).map(r=>`${r.player_name||''}`).filter(Boolean));
   renderPlayerBattleTeams(_pbtCurrentRows);
 }
 
@@ -1547,7 +1547,7 @@ function renderPlayerBattleTeams(rows){
     return;
   }
 
-  const getPlayerKey = r => `${r.player_name||''}__${r.union||r.union_name||''}`;
+  const getPlayerKey = r => `${r.player_name||''}`;
   const validKeys = new Set(_pbtCurrentRows.map(getPlayerKey).filter(Boolean));
   _pbtExpandedPlayers = new Set([..._pbtExpandedPlayers].filter(k=>validKeys.has(k)));
   const actionHtml = validKeys.size ? `<span style='margin-left:10px;display:inline-flex;gap:6px'><button class='btn' type='button' data-organization-action='expand-player' style='font-size:.68rem;padding:2px 8px'>全部展开</button><button class='btn' type='button' data-organization-action='collapse-player' style='font-size:.68rem;padding:2px 8px'>全部收起</button></span>` : '';
@@ -1563,7 +1563,7 @@ function renderPlayerBattleTeams(rows){
         type:'player',
         key: playerKey,
         playerName: r.player_name||'',
-        unionName: r.union||r.union_name||'',
+        unionName: r._player_union||'',  // 使用统计计算出的最新联盟
         clanName: r.clan_name||'',
         teamCount: r._player_team_count||0,
         totalBattles: r._player_total_battles||0,
@@ -1699,19 +1699,38 @@ async function loadPlayerBattleTeams(){
   if(!Array.isArray(data)) throw new Error('玩家队伍数据格式异常');
   clearOrganizationStatusHost(statusHost);
 
+  console.log('[PBT] API returned:', data.length, 'records');
+
   const filtered = dedupeBattleTeamsByHeroNames((data||[]).filter(r=>{
     const rowUnion = String(r.union||r.union_name||'').trim();
-    if(union && rowUnion !== String(union).trim()) return false;
+    if(union && rowUnion !== String(union).trim()) {
+      console.log('[PBT] Filtered by union:', r.player_name, 'union:', rowUnion, 'expected:', union);
+      return false;
+    }
     const heroCount = (r.heroes_str||'').split('+').filter(id=>Number(id)>0).length;
-    if(heroCount < 3) return false;
+    if(heroCount < 3) {
+      console.log('[PBT] Filtered by hero count:', r.player_name, 'count:', heroCount);
+      return false;
+    }
     const skillIds = (r.skills||'').split(',').filter(id=>Number(id)>0);
-    if(skillIds.length < 9) return false;
+    if(skillIds.length < 9) {
+      console.log('[PBT] Filtered by skill count:', r.player_name, 'count:', skillIds.length);
+      return false;
+    }
     const everyHeroHasThreeSkills = [0,1,2].every(idx=>skillIds.slice(idx*3, idx*3+3).length === 3);
-    if(!everyHeroHasThreeSkills) return false;
+    if(!everyHeroHasThreeSkills) {
+      console.log('[PBT] Filtered by skill distribution:', r.player_name);
+      return false;
+    }
     const troops = Number(r.max_troops)||0;
-    if(troops > 0 && troops < 10000) return false;
+    if(troops > 0 && troops < 10000) {
+      console.log('[PBT] Filtered by troops:', r.player_name, 'troops:', troops);
+      return false;
+    }
     return true;
-  }), r=>`${r.player_name||''}__${r.union||r.union_name||''}`);
+  }), r=>`${r.player_name||''}`);  // 只按玩家名去重，不包含联盟
+
+  console.log('[PBT] After filtering:', filtered.length, 'records');;
 
   if(!filtered.length){
     _pbtCurrentRows = [];
@@ -1727,7 +1746,7 @@ async function loadPlayerBattleTeams(){
 
   const playerStats = new Map();
   filtered.forEach(r=>{
-    const key = `${r.player_name||''}__${r.union||r.union_name||''}`;
+    const key = `${r.player_name||''}`;  // 只按玩家名分组，不包含联盟
     if(!playerStats.has(key)){
       playerStats.set(key, {
         teamCount: 0,
@@ -1737,6 +1756,8 @@ async function loadPlayerBattleTeams(){
         mainTeamText: '—',
         mainTeamCount: 0,
         mainTeamHeroes: [],
+        union: r.union || r.union_name || '',  // 初始联盟
+        maxBattleId: 0,  // 追踪最新战报
       });
     }
     const s = playerStats.get(key);
@@ -1744,6 +1765,12 @@ async function loadPlayerBattleTeams(){
     s.totalBattles += (r.cnt || 0);
     s.totalWins += (r.wins || 0);
     s.totalDraws += (r.draws || 0);
+    // 更新为最新战报的联盟（假设battle_id越大越新）
+    const currentBattleId = Number(r.battle_id || 0);
+    if(currentBattleId > s.maxBattleId){
+      s.maxBattleId = currentBattleId;
+      s.union = r.union || r.union_name || '';
+    }
     if((r.cnt || 0) > s.mainTeamCount){
       s.mainTeamCount = r.cnt || 0;
       const heroIds = (r.heroes_str||'').split('+').filter(id=>Number(id)>0);
@@ -1757,12 +1784,14 @@ async function loadPlayerBattleTeams(){
   });
 
   filtered.sort((a,b)=>{
-    const bKey = `${b.player_name||''}__${b.union||b.union_name||''}`;
-    const aKey = `${a.player_name||''}__${a.union||a.union_name||''}`;
+    const bKey = `${b.player_name||''}`;
+    const aKey = `${a.player_name||''}`;
     const ba = Number(playerStats.get(bKey)?.totalBattles||0);
     const aa = Number(playerStats.get(aKey)?.totalBattles||0);
     if(ba !== aa) return ba - aa;
-    const unionCmp = String(a.union||a.union_name||'').localeCompare(String(b.union||b.union_name||''),'zh-CN');
+    const bUnion = playerStats.get(bKey)?.union || '';
+    const aUnion = playerStats.get(aKey)?.union || '';
+    const unionCmp = String(aUnion).localeCompare(String(bUnion),'zh-CN');
     if(unionCmp!==0) return unionCmp;
     const pcmp=String(a.player_name||'').localeCompare(String(b.player_name||''),'zh-CN');
     if(pcmp!==0) return pcmp;
@@ -1770,7 +1799,7 @@ async function loadPlayerBattleTeams(){
   });
 
   filtered.forEach(r=>{
-    const s = playerStats.get(`${r.player_name||''}__${r.union||r.union_name||''}`);
+    const s = playerStats.get(`${r.player_name||''}`);
     r._player_team_count = s?.teamCount || 0;
     r._player_total_battles = s?.totalBattles || 0;
     r._player_total_wins = s?.totalWins || 0;
@@ -1779,6 +1808,7 @@ async function loadPlayerBattleTeams(){
     r._player_main_team_text = s?.mainTeamText || '—';
     r._player_main_team_count = s?.mainTeamCount || 0;
     r._player_main_team_heroes = s?.mainTeamHeroes || [];
+    r._player_union = s?.union || '';  // 使用统计出的最新联盟
   });
 
   renderPlayerBattleTeams(filtered);
@@ -2529,8 +2559,12 @@ function buildAllianceHeroMiniCard(hid){
   </span>`;
 }
 
+function getTeamHeroIds(row){
+  return (row.heroes_str||'').split('+').filter(id=>Number(id)>0);
+}
+
 function getTeamHeroNames(row){
-  return (row.heroes_str||'').split('+').filter(id=>Number(id)>0).map(hid=>{
+  return getTeamHeroIds(row).map(hid=>{
     if(typeof HERO_CFG!=='undefined'&&HERO_CFG[hid]) return HERO_CFG[hid].name||String(hid);
     return String(hid);
   });
@@ -2543,20 +2577,20 @@ function getTeamHeroNameKey(row){
 function dedupeBattleTeamsByHeroNames(rows, scopeBuilder){
   const scopedBuckets = new Map();
   (rows||[]).forEach(row=>{
-    const heroNames = getTeamHeroNames(row);
-    const heroNameSet = new Set(heroNames);
+    const heroIds = getTeamHeroIds(row);  // 使用英雄ID而不是名字
+    const heroIdSet = new Set(heroIds);
     const scopeKey = typeof scopeBuilder==='function' ? scopeBuilder(row) : '';
     if(!scopedBuckets.has(scopeKey)) scopedBuckets.set(scopeKey, []);
     const buckets = scopedBuckets.get(scopeKey);
 
     const matchedIdxs = [];
     buckets.forEach((bucket, idx)=>{
-      const hasOverlap = heroNames.some(name=>bucket.heroSet.has(name));
+      const hasOverlap = heroIds.some(id=>bucket.heroSet.has(id));  // 按ID判断重叠
       if(hasOverlap) matchedIdxs.push(idx);
     });
 
     if(!matchedIdxs.length){
-      buckets.push({ row:{...row, _dedupe_source_cnt: Number(row.cnt||0)}, heroSet: heroNameSet });
+      buckets.push({ row:{...row, _dedupe_source_cnt: Number(row.cnt||0)}, heroSet: heroIdSet });
       return;
     }
 
@@ -2574,7 +2608,7 @@ function dedupeBattleTeamsByHeroNames(rows, scopeBuilder){
       kept.hero_levels = row.hero_levels;
       kept._dedupe_source_cnt = Number(row.cnt||0);
     }
-    heroNames.forEach(name=>baseBucket.heroSet.add(name));
+    heroIds.forEach(id=>baseBucket.heroSet.add(id));  // 添加ID到集合
 
     for(let i=matchedIdxs.length-1;i>=1;i--){
       const mergeIdx = matchedIdxs[i];
@@ -2591,7 +2625,7 @@ function dedupeBattleTeamsByHeroNames(rows, scopeBuilder){
         kept.hero_levels = mergeBucket.row.hero_levels;
         kept._dedupe_source_cnt = Number(mergeBucket.row._dedupe_source_cnt||0);
       }
-      mergeBucket.heroSet.forEach(name=>baseBucket.heroSet.add(name));
+      mergeBucket.heroSet.forEach(id=>baseBucket.heroSet.add(id));  // 添加ID到集合
       buckets.splice(mergeIdx, 1);
     }
   });
@@ -5472,8 +5506,12 @@ function renderTeamDetails() {
         <tbody>
           ${data.matchups.map((m, i) => {
             const wrColor = m.win_rate >= 60 ? 'var(--green)' : m.win_rate >= 40 ? 'var(--gold)' : 'var(--red)';
-            const heroesArr = (m.opp_heroes||'').split(',').filter(Boolean);
-            const heroesDisplay = heroesArr.map(h => `<span style='background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:1px 6px;font-size:.68rem;margin:1px'>${esc(h)}</span>`).join('');
+            const heroesArr = String(m.opp_heroes || '').split(/[+,]/).map(h => h.trim()).filter(Boolean);
+            const heroesDisplay = heroesArr.map(hid => {
+              const hero = typeof HERO_CFG !== 'undefined' ? (HERO_CFG[hid] || HERO_CFG[String(hid)]) : null;
+              const name = hero && hero.name ? hero.name : hid;
+              return `<span style='background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:1px 6px;font-size:.68rem;margin:1px'>${esc(name)}</span>`;
+            }).join('');
             return `<tr>
               <td style='color:var(--text2)'>${i+1}</td>
               <td>${heroesDisplay || '—'}</td>

@@ -127,8 +127,9 @@
   display: grid;
   grid-template-columns:
     minmax(0, 1fr)
-    minmax(112px, .42fr)
-    minmax(112px, .42fr);
+    minmax(112px, .35fr)
+    minmax(112px, .35fr)
+    minmax(112px, .35fr);
   gap: 8px;
   padding: 0 12px 12px;
 }
