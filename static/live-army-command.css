@@ -93,6 +93,14 @@
     var(--shadow-hud);
 }
 
+.live-army-detail-panel {
+  position: sticky;
+  top: 12px;
+  align-self: start;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
+
 .live-army-index::before,
 .live-army-map-panel::before,
 .live-army-detail-panel::before {
