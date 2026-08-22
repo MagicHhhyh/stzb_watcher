@@ -63,7 +63,27 @@ class LiveArmyApiValidationTest(unittest.TestCase):
                     offline_minutes=value
                 )
 
-    def test_invalid_offline_minutes_is_400_without_opening_database(self):
+    def test_connection_closes_when_service_fails(self):
+        class TrackingConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        connection = TrackingConnection()
+        app = Flask(__name__)
+        app.config["TESTING"] = False
+        register_live_army_api(app, lambda: connection)
+        with patch(
+            "intelligence.live_army_api.LiveArmyService"
+        ) as service:
+            service.return_value.snapshot.side_effect = RuntimeError("database unavailable")
+            response = app.test_client().get("/api/intelligence/live-armies")
+
+        self.assertEqual(500, response.status_code)
+        self.assertTrue(connection.closed)
+
         for value in ("-1", "61", "bad"):
             with self.subTest(value=value):
                 response = self.client.get(

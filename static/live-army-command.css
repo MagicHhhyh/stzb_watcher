@@ -98,7 +98,7 @@
   top: 12px;
   align-self: start;
   max-height: calc(100vh - 24px);
-  overflow-y: auto;
+  overflow: visible;
 }
 
 .live-army-index::before,
@@ -620,6 +620,7 @@
 
 .live-army-detail {
   min-height: 0;
+  max-height: calc(100vh - 24px - 60px);
   padding: 12px;
   overflow: auto;
   scrollbar-color:
@@ -807,6 +808,65 @@
     );
   font-size: 11px;
   line-height: 1.65;
+}
+
+.live-army-candidate-title {
+  margin: 10px 0 8px;
+  color: var(--text-secondary);
+  font: 700 10px var(--font-mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.live-army-candidate-title:first-child {
+  margin-top: 0;
+}
+
+.live-army-candidate-evidence {
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.live-army-candidate-evidence:first-child {
+  margin-top: 0;
+}
+
+.live-army-candidate-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.live-army-candidate-head strong {
+  color: var(--text-primary);
+  font: 700 10px var(--font-mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.live-army-candidate-head img {
+  width: 24px;
+  height: 30px;
+  object-fit: cover;
+  border: 1px solid color-mix(in srgb, var(--live-army-accent) 20%, var(--border-subtle));
+  border-radius: 3px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--live-army-accent) 12%, var(--surface-3)),
+      var(--surface-1)
+    );
+}
+
+.live-army-candidate-details {
+  display: grid;
+  gap: 3px;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .live-army-evidence[data-status="exact"] {

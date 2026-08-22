@@ -109,6 +109,57 @@ test("search is normalized and does not infer unknown lineups", () => {
   );
 });
 
+test("search indexes all inferred candidate heroes", () => {
+  const inferredMultiple = fixtureArmy({
+    armyId: 814501,
+    lineup: {
+      status: "inferred",
+      complete: true,
+      battleId: 40,
+      heroes: [
+        { heroId: 100705, name: "杜预" },
+        { heroId: 100707, name: "卫瓘" },
+        { heroId: 100101, name: "灵帝" },
+      ],
+      lineupCandidates: [
+        {
+          rank: 1,
+          status: "inferred",
+          battleId: 40,
+          heroes: [
+            { heroId: 100705, name: "杜预" },
+            { heroId: 100707, name: "卫瓘" },
+            { heroId: 100101, name: "灵帝" },
+          ],
+        },
+        {
+          rank: 2,
+          status: "inferred",
+          battleId: 41,
+          heroes: [
+            { heroId: 100013, name: "司马懿" },
+            { heroId: 100649, name: "贾诩" },
+            { heroId: 100023, name: "荀彧" },
+          ],
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(
+    filterArmies([inferredMultiple], "杜预", "all").map((row) => row.armyId),
+    [814501],
+  );
+  assert.deepEqual(
+    filterArmies([inferredMultiple], "司马懿", "all").map((row) => row.armyId),
+    [814501],
+  );
+  assert.deepEqual(
+    filterArmies([inferredMultiple], "贾诩", "all").map((row) => row.armyId),
+    [814501],
+  );
+});
+
 test("state filter keeps only the selected current category", () => {
   const rows = [
     fixtureArmy({ armyId: 1, stateKey: "expedition" }),
@@ -1237,6 +1288,38 @@ test("load lifecycle preserves snapshot and cleans busy after refresh error", as
   assert.equal(summary.hasAttribute("aria-busy"), false);
   assert.equal(summary.classList.contains("hud-refresh-line"), false);
   assert.equal(controller.state.loading, false);
+});
+
+test("request deadline releases a stuck load and permits a retry", async () => {
+  const documentRef = new FakeDocument();
+  const windowRef = new FakeWindow();
+  const timers = fakeTimers();
+  const pending = new Promise(() => {});
+  let requestCount = 0;
+  const controller = createLiveArmyCommand({
+    documentRef,
+    windowRef,
+    fetchFn: () => {
+      requestCount += 1;
+      return requestCount === 1 ? pending : response(snapshot());
+    },
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    setIntervalFn: timers.setIntervalFn,
+    clearIntervalFn: timers.clearIntervalFn,
+    requestTimeoutMs: 15_000,
+    mapModule: fakeMapModule(),
+  });
+
+  const stuck = controller.load();
+  await timers.runTimeout(15_000);
+  await stuck;
+
+  assert.equal(controller.state.loading, false);
+  assert.match(controller.state.lastError, /超时/);
+  await controller.load(true);
+  assert.equal(requestCount, 2);
+  assert.ok(controller.state.snapshot);
 });
 
 test("merged in-flight load keeps one owner until dirty follow-up completes", async () => {

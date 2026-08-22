@@ -111,6 +111,8 @@ class WorldSceneStore:
             );
             CREATE INDEX IF NOT EXISTS idx_world_tiles_row_col ON world_tiles(row, col);
             CREATE INDEX IF NOT EXISTS idx_world_armies_user ON world_armies(user_id);
+            CREATE INDEX IF NOT EXISTS idx_world_armies_current_source ON world_armies(deleted_at_seq, source_seq);
+            CREATE INDEX IF NOT EXISTS idx_world_scene_packets_observed_at ON world_scene_packets(observed_at_ms);
             CREATE INDEX IF NOT EXISTS idx_world_scene_entities_category ON world_scene_entities(category);
             """
         )

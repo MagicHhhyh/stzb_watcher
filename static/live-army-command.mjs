@@ -126,6 +126,8 @@ export function createLiveArmyCommand({
   fetchFn = globalThis.fetch?.bind(globalThis),
   setTimeoutFn = globalThis.setTimeout?.bind(globalThis),
   clearTimeoutFn = globalThis.clearTimeout?.bind(globalThis),
+  AbortControllerFn = globalThis.AbortController,
+  requestTimeoutMs = 15_000,
   setIntervalFn = globalThis.setInterval?.bind(globalThis),
   clearIntervalFn = globalThis.clearInterval?.bind(globalThis),
   nowFn = Date.now,
@@ -178,10 +180,27 @@ export function createLiveArmyCommand({
     beginLoadLifecycle();
     const requestRevision = state.eventRevision;
     const request = (async () => {
+      let timeoutId = null;
+      const controller = typeof AbortControllerFn === "function"
+        ? new AbortControllerFn()
+        : null;
+      let timeoutError = null;
+      const timeout = new Promise((_, reject) => {
+        if (typeof setTimeoutFn !== "function") return;
+        timeoutId = setTimeoutFn(() => {
+          timeoutError = new Error("实时部队请求超时，请重试");
+          controller?.abort?.();
+          reject(timeoutError);
+        }, requestTimeoutMs);
+      });
       try {
-        const response = await fetchFn(LIVE_ARMY_ENDPOINT, {
-          cache: "no-store",
-        });
+        const response = await Promise.race([
+          fetchFn(LIVE_ARMY_ENDPOINT, {
+            cache: "no-store",
+            ...(controller ? { signal: controller.signal } : {}),
+          }),
+          timeout,
+        ]);
         const body = await response.json();
         if (!response.ok || body?.ok === false) {
           throw new Error(body?.error || `HTTP ${response.status || 500}`);
@@ -214,10 +233,14 @@ export function createLiveArmyCommand({
         syncTicker();
         return body;
       } catch (error) {
-        state.lastError = error?.message || "实时部队加载失败";
+        const timedOut = error === timeoutError || Boolean(controller?.signal?.aborted);
+        state.lastError = timedOut
+          ? "实时部队请求超时，请重试"
+          : error?.message || "实时部队加载失败";
         renderError(state.lastError, Boolean(state.snapshot));
         return null;
       } finally {
+        if (timeoutId !== null) clearTimeoutFn?.(timeoutId);
         if (state.loadingOwner === loadOwner) {
           state.loading = false;
           state.loadingOwner = 0;
@@ -681,6 +704,9 @@ export function createLiveArmyCommand({
     const visibleExact = visibleCurrent.filter(
       (army) => army?.lineup?.status === "exact",
     ).length;
+    const visibleInferred = visibleCurrent.filter(
+      (army) => army?.lineup?.status === "inferred",
+    ).length;
     const models = [
       [timeFilterLabel(state.timeFilter), visibleCurrent.length, "#38bdf8"],
       [
@@ -697,6 +723,7 @@ export function createLiveArmyCommand({
         "#f5b84b",
       ],
       ["精确阵容", visibleExact, "#8b6cff"],
+      ["推测阵容", visibleInferred, "#c98555"],
       ["最近离线", visible.recentOffline.length, "#f5b84b"],
     ];
     const cards = models.map(([label, value, color]) => {
@@ -745,7 +772,11 @@ export function createLiveArmyCommand({
     );
     button.setAttribute?.(
       "data-lineup-status",
-      army?.lineup?.status === "exact" ? "exact" : "unknown",
+      army?.lineup?.status === "exact"
+        ? "exact"
+        : army?.lineup?.status === "inferred"
+          ? "inferred"
+          : "unknown",
     );
     button.setAttribute?.(
       "data-activity",
@@ -862,7 +893,7 @@ export function createLiveArmyCommand({
 
   function lineupPreview(lineup) {
     const wrapper = node("span", "live-army-card-lineup");
-    if (lineup?.status !== "exact" || !lineup?.heroes?.length) {
+    if (lineup?.status !== "exact" && lineup?.status !== "inferred") {
       wrapper.append(
         textNode(
           "strong",
@@ -872,14 +903,21 @@ export function createLiveArmyCommand({
       );
       return wrapper;
     }
-    for (const hero of lineup.heroes.slice(0, 3)) {
+    if (lineup.status === "inferred") {
+      const candidateCount = lineup?.lineupCandidates?.length || 1;
+      wrapper.append(
+        textNode("em", "", `推测 · ${candidateCount} 个候选 · `),
+      );
+    }
+    const heroes = lineup?.lineupCandidates?.[0]?.heroes || lineup.heroes || [];
+    for (const hero of heroes.slice(0, 3)) {
       wrapper.append(heroImage(hero, false));
     }
     wrapper.append(
       textNode(
         "strong",
         "",
-        lineup.heroes.map(heroName).join(" / "),
+        heroes.map(heroName).join(" / "),
       ),
     );
     return wrapper;
@@ -1026,6 +1064,22 @@ export function createLiveArmyCommand({
         heroes.append(heroCard(hero));
       }
       lineupSection.append(heroes);
+    } else if (
+      army.lineup?.status === "inferred"
+      && army.lineup?.lineupCandidates?.length
+    ) {
+      for (const candidate of army.lineup.lineupCandidates) {
+        const candidateTitle = textNode(
+          "h5",
+          "live-army-candidate-title",
+          `候选阵容 ${candidate.rank || "?"}`,
+        );
+        const heroes = node("div", "live-army-hero-grid");
+        for (const hero of candidate.heroes || []) {
+          heroes.append(heroCard(hero));
+        }
+        lineupSection.append(candidateTitle, heroes);
+      }
     } else {
       lineupSection.append(
         textNode(
@@ -1039,10 +1093,15 @@ export function createLiveArmyCommand({
       "section",
       "live-army-detail-section",
     );
-    evidenceSection.append(textNode("h4", "", "严格证据"));
+    evidenceSection.append(
+      textNode(
+        "h4",
+        "",
+        army.lineup?.status === "inferred" ? "推测依据" : "严格证据",
+      ),
+    );
     const evidence = node("div", "live-army-evidence");
-    const status =
-      army.lineup?.status === "exact" ? "exact" : "unknown";
+    const status = army.lineup?.status || "unknown";
     evidence.setAttribute?.("data-status", status);
     if (status === "exact") {
       evidence.append(
@@ -1066,6 +1125,57 @@ export function createLiveArmyCommand({
           "仅按 army_id 与 atk_team_id / def_team_id 精确匹配，不按玩家或同盟推测。",
         ),
       );
+    } else if (status === "inferred") {
+      if (army.lineup?.lineupCandidates?.length) {
+        for (const candidate of army.lineup.lineupCandidates) {
+          const candidateBox = node("div", "live-army-candidate-evidence");
+          const candidateHead = node("div", "live-army-candidate-head");
+          candidateHead.append(
+            textNode("strong", "", `候选 ${candidate.rank || "?"}`),
+          );
+          for (const hero of candidate.heroes || []) {
+            candidateHead.append(heroImage(hero, false));
+          }
+          const candidateDetails = node("div", "live-army-candidate-details");
+          candidateDetails.append(
+            textNode(
+              "div",
+              "",
+              `战报 #${Number(candidate.battleId) || 0} · ${candidate.battleTimeText || formatDateTime(
+                candidate.battleTime,
+              )} · ${candidate.side === "def" ? "防守方" : "进攻方"}`,
+            ),
+          );
+          for (const detail of candidate.evidence || []) {
+            candidateDetails.append(textNode("small", "", String(detail)));
+          }
+          candidateBox.append(candidateHead, candidateDetails);
+          evidence.append(candidateBox);
+        }
+      } else {
+        evidence.append(
+          textNode(
+            "strong",
+            "",
+            `推测候选战报 #${Number(army.lineup.battleId) || 0}`,
+          ),
+          textNode(
+            "div",
+            "",
+            `${army.lineup.battleTimeText || formatDateTime(
+              army.lineup.battleTime,
+            )} · ${army.lineup.side === "def" ? "防守方" : "进攻方"} · 三将完整`,
+          ),
+          textNode(
+            "small",
+            "",
+            army.lineup?.message || "同一玩家近期完整战报，非同 ID 精确匹配。",
+          ),
+        );
+        for (const detail of army.lineup?.evidence || []) {
+          evidence.append(textNode("small", "", String(detail)));
+        }
+      }
     } else {
       evidence.append(
         textNode(
@@ -1076,7 +1186,7 @@ export function createLiveArmyCommand({
         textNode(
           "small",
           "",
-          "严格模式已启用：不会使用同玩家近期阵容补全。",
+          "没有满足同一玩家、近期且三将完整条件的候选战报。",
         ),
       );
     }
@@ -1292,12 +1402,29 @@ function searchTextForArmy(army) {
   const owner = army?.owner || {};
   const location = army?.location || {};
   const lineup = army?.lineup || {};
-  const heroes = lineup.status === "exact"
-    ? (lineup.heroes || []).flatMap((hero) => [
+  let heroes = [];
+
+  if (lineup.status === "exact") {
+    heroes = (lineup.heroes || []).flatMap((hero) => [
       hero?.heroId ?? hero?.id,
       hero?.name,
-    ])
-    : [lineup.message || "阵容未知"];
+    ]);
+  } else if (lineup.status === "inferred" && lineup?.lineupCandidates?.length) {
+    heroes = lineup.lineupCandidates.flatMap((candidate) =>
+      (candidate.heroes || []).flatMap((hero) => [
+        hero?.heroId ?? hero?.id,
+        hero?.name,
+      ])
+    );
+  } else if (lineup.status === "inferred" && lineup.heroes?.length) {
+    heroes = (lineup.heroes || []).flatMap((hero) => [
+      hero?.heroId ?? hero?.id,
+      hero?.name,
+    ]);
+  } else {
+    heroes = [lineup.message || "阵容未知"];
+  }
+
   return [
     army?.armyId,
     army?.state,
@@ -1483,4 +1610,80 @@ if (typeof window !== "undefined") {
     emitHudEvent: (event) => window.HudSystem?.emit(event),
     resolveHudEvent: (key) => window.HudSystem?.resolveEvent(key),
   });
+
+  // 实现detail-panel的固定滚动效果
+  function initDetailPanelSticky() {
+    const detailPanel = document.querySelector('.live-army-detail-panel');
+    const shell = document.querySelector('.live-army-shell');
+    if (!detailPanel || !shell) return;
+
+    let originalTop = 0;
+    let originalRight = 0;
+    let originalWidth = 0;
+    let isFixed = false;
+
+    function updatePosition() {
+      const shellRect = shell.getBoundingClientRect();
+      const panelRect = detailPanel.getBoundingClientRect();
+
+      if (!isFixed) {
+        originalTop = shellRect.top + window.scrollY;
+        const shellStyle = window.getComputedStyle(shell);
+        const gap = parseFloat(shellStyle.gap) || 12;
+        originalRight = window.innerWidth - shellRect.right;
+        originalWidth = panelRect.width;
+      }
+
+      // 当shell顶部滚出视口时，固定panel
+      if (shellRect.top <= 12 && !isFixed) {
+        isFixed = true;
+        detailPanel.style.position = 'fixed';
+        detailPanel.style.top = '12px';
+        detailPanel.style.right = originalRight + 'px';
+        detailPanel.style.width = originalWidth + 'px';
+        detailPanel.style.zIndex = '100';
+      }
+      // 当shell顶部回到视口时，恢复正常
+      else if (shellRect.top > 12 && isFixed) {
+        isFixed = false;
+        detailPanel.style.position = '';
+        detailPanel.style.top = '';
+        detailPanel.style.right = '';
+        detailPanel.style.width = '';
+        detailPanel.style.zIndex = '';
+      }
+
+      // 当shell底部滚出视口时，停止固定
+      if (isFixed) {
+        const shellBottom = shellRect.bottom;
+        const panelHeight = panelRect.height;
+        if (shellBottom < panelHeight + 12) {
+          detailPanel.style.position = 'absolute';
+          detailPanel.style.top = (shellRect.height - panelHeight) + 'px';
+          detailPanel.style.right = '0';
+        }
+      }
+    }
+
+    window.addEventListener('scroll', updatePosition, { passive: true });
+    window.addEventListener('resize', () => {
+      isFixed = false;
+      detailPanel.style.position = '';
+      detailPanel.style.top = '';
+      detailPanel.style.right = '';
+      detailPanel.style.width = '';
+      detailPanel.style.zIndex = '';
+      updatePosition();
+    });
+
+    // 初始化
+    setTimeout(updatePosition, 100);
+  }
+
+  // 当tab切换到实时部队时初始化
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDetailPanelSticky);
+  } else {
+    initDetailPanelSticky();
+  }
 }

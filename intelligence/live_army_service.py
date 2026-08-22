@@ -50,6 +50,8 @@ class LiveArmyService:
         self._now_ms = now_ms
         self._tables = _table_names(connection)
         self._columns: Dict[str, set] = {}
+        self._hero_meta = sim_data.hero_index()
+        self._skill_meta = sim_data.skill_index()
 
     def snapshot(self, offline_minutes: int = 10) -> Dict[str, Any]:
         now_ms = self.now_ms()
@@ -63,9 +65,7 @@ class LiveArmyService:
             include_offline=bool(offline_minutes),
         )
         all_rows = current_rows + offline_rows
-        lineup_by_army = self._lineups(
-            [_int(row["army_id"]) for row in all_rows]
-        )
+        lineup_by_army = self._lineups(all_rows)
 
         current = [
             self._project_army(row, lineup_by_army, now_ms, offline=False)
@@ -99,6 +99,9 @@ class LiveArmyService:
         exact = sum(
             1 for row in current if row["lineup"]["status"] == "exact"
         )
+        inferred = sum(
+            1 for row in current if row["lineup"]["status"] == "inferred"
+        )
         observed_at_ms = _int(version["observed_at_ms"])
         return {
             "ok": True,
@@ -115,7 +118,8 @@ class LiveArmyService:
                 "moving": moving,
                 "stationary": stationary,
                 "exactLineups": exact,
-                "unknownLineups": len(current) - exact,
+                "inferredLineups": inferred,
+                "unknownLineups": len(current) - exact - inferred,
                 "recentOffline": len(recent_offline),
             },
             "bounds": _bounds_for_armies(current),
@@ -146,6 +150,7 @@ class LiveArmyService:
                 "moving": 0,
                 "stationary": 0,
                 "exactLineups": 0,
+                "inferredLineups": 0,
                 "unknownLineups": 0,
                 "recentOffline": 0,
             },
@@ -437,33 +442,240 @@ class LiveArmyService:
         }
 
     def _lineups(
-        self, army_ids: Sequence[int]
+        self, army_rows: Sequence[sqlite3.Row]
     ) -> Dict[int, Dict[str, Any]]:
-        army_ids = sorted({_int(value) for value in army_ids if _int(value)})
-        if not army_ids or "battles_v2" not in self._tables:
-            return {}
-        columns = self._table_columns("battles_v2")
-        required = {
-            "battle_id",
-            "time",
-            "atk_team_id",
-            "def_team_id",
+        army_by_id = {
+            _int(row["army_id"]): dict(row)
+            for row in army_rows
+            if _int(row["army_id"])
         }
-        if not required.issubset(columns):
+        army_ids = sorted(army_by_id)
+        if not army_ids:
             return {}
 
-        placeholders = ",".join("?" for _ in army_ids)
+        result: Dict[int, Dict[str, Any]] = {}
+        if "latest_complete_lineups" in self._tables:
+            placeholders = ",".join("?" for _ in army_ids)
+            indexed_rows = self.connection.execute(
+                f"""
+                SELECT * FROM latest_complete_lineups
+                WHERE team_id IN ({placeholders})
+                ORDER BY team_id, battle_time DESC, battle_id DESC
+                """,
+                army_ids,
+            ).fetchall()
+            for raw_row in indexed_rows:
+                row = dict(raw_row)
+                army_id = _int(row.get("team_id"))
+                if army_id in result:
+                    continue
+                side = str(row.get("side") or "")
+                lineup_row = {
+                    "battle_id": row.get("battle_id"),
+                    "time": row.get("battle_time"),
+                    "time_str": row.get("battle_time_text"),
+                    "all_skill_info": row.get("all_skill_info"),
+                    f"{side}_team_id": army_id,
+                    f"{side}_hero1_id": row.get("hero1_id"),
+                    f"{side}_hero2_id": row.get("hero2_id"),
+                    f"{side}_hero3_id": row.get("hero3_id"),
+                    f"{side}_hero1_level": row.get("hero1_level"),
+                    f"{side}_hero2_level": row.get("hero2_level"),
+                    f"{side}_hero3_level": row.get("hero3_level"),
+                    f"{side}_hero1_star": row.get("hero1_star"),
+                    f"{side}_hero2_star": row.get("hero2_star"),
+                    f"{side}_hero3_star": row.get("hero3_star"),
+                }
+                lineup = self._lineup_from_battle(lineup_row, side, "exact")
+                if lineup is not None:
+                    result[army_id] = lineup
+        elif "battles_v2" in self._tables:
+            columns = self._table_columns("battles_v2")
+            required = {"battle_id", "time", "atk_team_id", "def_team_id"}
+            if not required.issubset(columns):
+                return {}
+            select_columns = self._lineup_select_columns(columns)
+            placeholders = ",".join("?" for _ in army_ids)
+            rows = self.connection.execute(
+                f"""
+                SELECT {','.join(select_columns)}
+                FROM battles_v2
+                WHERE atk_team_id IN ({placeholders})
+                   OR def_team_id IN ({placeholders})
+                ORDER BY COALESCE(time,0) DESC, battle_id DESC
+                """,
+                army_ids + army_ids,
+            ).fetchall()
+            army_id_set = set(army_ids)
+            for raw_row in rows:
+                row = dict(raw_row)
+                for army_id, side in (
+                    (_int(row.get("atk_team_id")), "atk"),
+                    (_int(row.get("def_team_id")), "def"),
+                ):
+                    if army_id in army_id_set and army_id not in result:
+                        lineup = self._lineup_from_battle(row, side, "exact")
+                        if lineup is not None and lineup["complete"]:
+                            result[army_id] = lineup
+
+        unmatched = [
+            (army_id, army)
+            for army_id, army in army_by_id.items()
+            if army_id not in result and str(army.get("owner_name") or "").strip()
+        ]
+        if not unmatched:
+            return result
+
+        owner_names = sorted(
+            {str(army.get("owner_name") or "").strip() for _, army in unmatched}
+        )
+        observed_at_seconds = [
+            _int(army.get("source_observed_at_ms")) // 1000
+            for _, army in unmatched
+            if _int(army.get("source_observed_at_ms"))
+        ]
+        if not owner_names or not observed_at_seconds:
+            return result
+        window_seconds = 48 * 60 * 60
+        minimum_time = max(0, min(observed_at_seconds) - window_seconds)
+        maximum_time = max(observed_at_seconds) + window_seconds
+        owner_placeholders = ",".join("?" for _ in owner_names)
+
+        if "latest_complete_lineups" in self._tables:
+            inferred_rows = self.connection.execute(
+                f"""
+                SELECT * FROM latest_complete_lineups
+                WHERE player_name IN ({owner_placeholders})
+                  AND battle_time BETWEEN ? AND ?
+                ORDER BY battle_time DESC, battle_id DESC
+                """,
+                owner_names + [minimum_time, maximum_time],
+            ).fetchall()
+            candidates_by_owner: Dict[str, List[Dict[str, Any]]] = {}
+            for raw_row in inferred_rows:
+                row = dict(raw_row)
+                side = str(row.get("side") or "")
+                candidate = {
+                    "battle_id": row.get("battle_id"),
+                    "time": row.get("battle_time"),
+                    "time_str": row.get("battle_time_text"),
+                    "all_skill_info": row.get("all_skill_info"),
+                    f"{side}_team_id": row.get("team_id"),
+                    f"{side}_hero1_id": row.get("hero1_id"),
+                    f"{side}_hero2_id": row.get("hero2_id"),
+                    f"{side}_hero3_id": row.get("hero3_id"),
+                    f"{side}_hero1_level": row.get("hero1_level"),
+                    f"{side}_hero2_level": row.get("hero2_level"),
+                    f"{side}_hero3_level": row.get("hero3_level"),
+                    f"{side}_hero1_star": row.get("hero1_star"),
+                    f"{side}_hero2_star": row.get("hero2_star"),
+                    f"{side}_hero3_star": row.get("hero3_star"),
+                    "_side": side,
+                }
+                candidates_by_owner.setdefault(
+                    str(row.get("player_name") or "").strip(), []
+                ).append(candidate)
+            for army_id, army in unmatched:
+                owner_name = str(army.get("owner_name") or "").strip()
+                observed_at = _int(army.get("source_observed_at_ms")) // 1000
+                candidates = []
+                for row in candidates_by_owner.get(owner_name, []):
+                    battle_time = _int(row.get("time"))
+                    delta = abs(battle_time - observed_at)
+                    lineup = self._lineup_from_battle(
+                        row, str(row.get("_side") or ""), "inferred"
+                    )
+                    if lineup is None:
+                        continue
+                    candidates.append((delta, -_int(row.get("battle_id")), lineup))
+
+                if candidates:
+                    candidates.sort()
+                    lineup_candidates = []
+                    for rank, (delta, neg_battle_id, lineup) in enumerate(candidates, start=1):
+                        lineup["message"] = "推测阵容：同一玩家近期完整战报，非同 ID 精确匹配"
+                        lineup["confidence"] = "medium"
+                        lineup["evidence"] = [
+                            f"玩家名一致：{owner_name}",
+                            f"战报与观测相差 {delta} 秒",
+                            "战报侧三将完整",
+                        ]
+                        lineup["rank"] = rank
+                        lineup_candidates.append(lineup)
+
+                    result[army_id] = {
+                        **lineup_candidates[0],
+                        "lineupCandidates": lineup_candidates,
+                    }
+            return result
+
+        if "battles_v2" not in self._tables:
+            return result
+        columns = self._table_columns("battles_v2")
+        required = {"battle_id", "time", "atk_team_id", "def_team_id"}
+        if not required.issubset(columns):
+            return result
+        select_columns = self._lineup_select_columns(columns)
+        inferred_rows = self.connection.execute(
+            f"""
+            SELECT {','.join(select_columns)}
+            FROM battles_v2
+            WHERE COALESCE(time,0) BETWEEN ? AND ?
+              AND (atk_name IN ({owner_placeholders})
+                   OR def_name IN ({owner_placeholders}))
+            ORDER BY COALESCE(time,0) DESC, battle_id DESC
+            """,
+            [minimum_time, maximum_time] + owner_names + owner_names,
+        ).fetchall()
+        for army_id, army in unmatched:
+            owner_name = str(army.get("owner_name") or "").strip()
+            observed_at_seconds = _int(army.get("source_observed_at_ms")) // 1000
+            candidates = []
+            for raw_row in inferred_rows:
+                row = dict(raw_row)
+                battle_time = _int(row.get("time"))
+                if not battle_time or abs(battle_time - observed_at_seconds) > window_seconds:
+                    continue
+                for side, name_column in (("atk", "atk_name"), ("def", "def_name")):
+                    if str(row.get(name_column) or "").strip() != owner_name:
+                        continue
+                    lineup = self._lineup_from_battle(row, side, "inferred")
+                    if lineup is None or not lineup["complete"]:
+                        continue
+                    delta = abs(battle_time - observed_at_seconds)
+                    candidates.append((delta, -_int(row.get("battle_id")), lineup))
+
+            if candidates:
+                candidates.sort()
+                lineup_candidates = []
+                for rank, (delta, neg_battle_id, lineup) in enumerate(candidates, start=1):
+                    lineup["message"] = "推测阵容：同一玩家近期完整战报，非同 ID 精确匹配"
+                    lineup["confidence"] = "medium"
+                    lineup["evidence"] = [
+                        f"玩家名一致：{owner_name}",
+                        f"战报与观测相差 {delta} 秒",
+                        "战报侧三将完整",
+                    ]
+                    lineup["rank"] = rank
+                    lineup_candidates.append(lineup)
+
+                result[army_id] = {
+                    **lineup_candidates[0],
+                    "lineupCandidates": lineup_candidates,
+                }
+        return result
+
+    @staticmethod
+    def _lineup_select_columns(columns: set) -> List[str]:
         select_columns = [
             "battle_id",
             "time",
             "time_str" if "time_str" in columns else "'' AS time_str",
             "atk_team_id",
             "def_team_id",
-            (
-                "all_skill_info"
-                if "all_skill_info" in columns
-                else "'' AS all_skill_info"
-            ),
+            "atk_name" if "atk_name" in columns else "'' AS atk_name",
+            "def_name" if "def_name" in columns else "'' AS def_name",
+            "all_skill_info" if "all_skill_info" in columns else "'' AS all_skill_info",
         ]
         for side in ("atk", "def"):
             for position in (1, 2, 3):
@@ -472,105 +684,68 @@ class LiveArmyService:
                     select_columns.append(
                         name if name in columns else f"0 AS {name}"
                     )
-        parameters = list(army_ids) + list(army_ids)
-        rows = self.connection.execute(
-            f"""
-            SELECT {','.join(select_columns)}
-            FROM battles_v2
-            WHERE atk_team_id IN ({placeholders})
-               OR def_team_id IN ({placeholders})
-            ORDER BY COALESCE(time,0) DESC, battle_id DESC
-            """,
-            parameters,
-        ).fetchall()
-        hero_meta = sim_data.hero_index()
-        skill_meta = sim_data.skill_index()
-        result: Dict[int, Dict[str, Any]] = {}
-        army_id_set = set(army_ids)
-        for raw_row in rows:
-            row = dict(raw_row)
-            candidates = []
-            atk_team_id = _int(row.get("atk_team_id"))
-            def_team_id = _int(row.get("def_team_id"))
-            if atk_team_id in army_id_set:
-                candidates.append((atk_team_id, "atk"))
-            if def_team_id in army_id_set:
-                candidates.append((def_team_id, "def"))
-            skills = _parse_skill_info(row.get("all_skill_info"))
-            for army_id, side in candidates:
-                if army_id in result:
-                    continue
-                hero_ids = [
-                    _int(row.get(f"{side}_hero{position}_id"))
-                    for position in (1, 2, 3)
-                ]
-                if not any(hero_ids):
-                    continue
-                heroes = []
-                for position, hero_id in enumerate(hero_ids, start=1):
-                    if hero_id <= 0:
-                        continue
-                    meta = dict(hero_meta.get(hero_id) or {})
-                    meta.setdefault("id", hero_id)
-                    meta.setdefault("name", f"武将 {hero_id}")
-                    meta.setdefault("camp", 0)
-                    meta.setdefault("army", 0)
-                    meta.setdefault("quality", 0)
-                    meta.setdefault("iconId", hero_id)
-                    meta.setdefault("portraitUrl", UNKNOWN_PORTRAIT)
-                    meta.setdefault(
-                        "portraitFallbackUrl", UNKNOWN_PORTRAIT
-                    )
-                    meta.setdefault("portraitLocal", False)
-                    skill_position = (
-                        position if side == "atk" else position + 3
-                    )
-                    hero_skills = []
-                    for skill in skills.get(skill_position, []):
-                        skill_id = _int(skill.get("skillId"))
-                        resolved = skill_meta.get(skill_id) or {}
-                        hero_skills.append(
-                            {
-                                "id": skill_id,
-                                "name": resolved.get("name")
-                                or f"战法 {skill_id}",
-                                "level": _int(skill.get("level")),
-                            }
-                        )
-                    heroes.append(
-                        {
-                            **meta,
-                            "position": position - 1,
-                            "level": _int(
-                                row.get(
-                                    f"{side}_hero{position}_level"
-                                )
-                            ),
-                            "advance": _int(
-                                row.get(
-                                    f"{side}_hero{position}_star"
-                                )
-                            ),
-                            "skills": hero_skills,
-                        }
-                    )
-                result[army_id] = {
-                    "status": "exact",
-                    "complete": len(heroes) == 3,
-                    "battleId": _int(row.get("battle_id")),
-                    "battleTime": _int(row.get("time")),
-                    "battleTimeText": str(
-                        row.get("time_str") or ""
-                    ),
-                    "side": side,
-                    "heroes": heroes,
-                    "message": (
-                        "精确阵容"
-                        if len(heroes) == 3
-                        else "精确命中，阵容不完整"
-                    ),
+        return select_columns
+
+    def _lineup_from_battle(
+        self, row: Dict[str, Any], side: str, status: str
+    ) -> Optional[Dict[str, Any]]:
+        hero_ids = [
+            _int(row.get(f"{side}_hero{position}_id"))
+            for position in (1, 2, 3)
+        ]
+        if not any(hero_ids):
+            return None
+        hero_meta = self._hero_meta
+        skill_meta = self._skill_meta
+        skills = _parse_skill_info(row.get("all_skill_info"))
+        heroes = []
+        for position, hero_id in enumerate(hero_ids, start=1):
+            if hero_id <= 0:
+                continue
+            meta = dict(hero_meta.get(hero_id) or {})
+            meta.setdefault("id", hero_id)
+            meta.setdefault("name", f"武将 {hero_id}")
+            meta.setdefault("camp", 0)
+            meta.setdefault("army", 0)
+            meta.setdefault("quality", 0)
+            meta.setdefault("iconId", hero_id)
+            meta.setdefault("portraitUrl", UNKNOWN_PORTRAIT)
+            meta.setdefault("portraitFallbackUrl", UNKNOWN_PORTRAIT)
+            meta.setdefault("portraitLocal", False)
+            skill_position = position if side == "atk" else position + 3
+            hero_skills = []
+            for skill in skills.get(skill_position, []):
+                skill_id = _int(skill.get("skillId"))
+                resolved = skill_meta.get(skill_id) or {}
+                hero_skills.append(
+                    {
+                        "id": skill_id,
+                        "name": resolved.get("name") or f"战法 {skill_id}",
+                        "level": _int(skill.get("level")),
+                    }
+                )
+            heroes.append(
+                {
+                    **meta,
+                    "position": position - 1,
+                    "level": _int(row.get(f"{side}_hero{position}_level")),
+                    "advance": _int(row.get(f"{side}_hero{position}_star")),
+                    "skills": hero_skills,
                 }
-        return result
+            )
+        complete = len(heroes) == 3
+        return {
+            "status": status,
+            "complete": complete,
+            "battleId": _int(row.get("battle_id")),
+            "battleTime": _int(row.get("time")),
+            "battleTimeText": str(row.get("time_str") or ""),
+            "side": side,
+            "heroes": heroes,
+            "message": (
+                "精确阵容" if complete else "精确命中，阵容不完整"
+            ) if status == "exact" else "推测阵容",
+        }
 
     def _table_columns(self, table: str) -> set:
         if table not in self._columns:

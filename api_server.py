@@ -473,6 +473,21 @@ def ensure_all_tables(db_path):
     try:
         # 8. 打包版也能自给自足地补齐 battles_v2 常用列
         _ensure_battles_v2_columns(conn)
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_bv2_atk_team_id '
+            'ON battles_v2(atk_team_id)'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_bv2_def_team_id '
+            'ON battles_v2(def_team_id)'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_world_state_versions_version '
+            'ON world_state_versions(version)'
+        )
+        from battle_lineup_index import ensure_schema as _ensure_lineup_index_schema
+        _ensure_lineup_index_schema(conn)
+        conn.commit()
     except Exception as e:
         print(f'[init] ensure battles_v2 columns: {e}')
     try:
@@ -522,7 +537,7 @@ def get_db():
             if abs_db_path not in _initialized_dbs:
                 ensure_all_tables(db_path)
                 _initialized_dbs.add(abs_db_path)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -2176,6 +2191,110 @@ def api_battles_all():
 
 
 # ===== 玩家队伍统计 =====
+def _read_materialized_player_teams(conn, player='', union='', side='', limit=200):
+    """Read complete lineup summaries while preserving the legacy response shape."""
+    try:
+        conn.execute('SELECT 1 FROM player_team_summaries LIMIT 1').fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+    where = ['1=1']
+    params = []
+    if player:
+        where.append('player_name LIKE ?')
+        params.append(f'%{player}%')
+    if union:
+        where.append('player_union LIKE ?')
+        params.append(f'%{union}%')
+    if side in ('atk', 'def'):
+        where.append('side=?')
+        params.append(side)
+    rows = conn.execute(
+        f'''SELECT player_name, player_uid, side, hero1_id, hero2_id, hero3_id,
+                   player_union, clan_name, battle_count, win_count, draw_count,
+                   latest_battle_id, latest_battle_time, hero1_star, hero2_star,
+                   hero3_star, all_skill_info, max_troops
+            FROM player_team_summaries
+            WHERE {' AND '.join(where)}''',
+        params,
+    ).fetchall()
+    if not rows:
+        return []
+
+    def parse_skills(raw, positions):
+        values = {}
+        for segment in str(raw or '').split(';'):
+            parts = segment.split(',')
+            if len(parts) < 2:
+                continue
+            try:
+                position = int(parts[0])
+            except (TypeError, ValueError):
+                continue
+            values[position] = [part for part in parts[1::2] if part]
+        result = []
+        for position in positions:
+            result.extend(values.get(position, []))
+        return ','.join(result)
+
+    from collections import defaultdict
+    merged = defaultdict(lambda: {
+        'cnt': 0, 'wins': 0, 'draws': 0, 'union': '', 'uid': '',
+        'hero_stars': [0, 0, 0], 'skills': '', 'heroes_str': '',
+        'clan_name': '', 'max_troops': 0, 'max_time': 0, 'max_battle_id': 0,
+        'sides': set(),
+    })
+    for row in rows:
+        r = dict(row)
+        hero_ids = [int(r.get(f'hero{i}_id') or 0) for i in (1, 2, 3)]
+        if any(hero_id <= 0 for hero_id in hero_ids):
+            continue
+        key = (r['player_name'], r.get('player_uid') or '', *hero_ids)
+        item = merged[key]
+        item['cnt'] += int(r.get('battle_count') or 0)
+        item['wins'] += int(r.get('win_count') or 0)
+        item['draws'] += int(r.get('draw_count') or 0)
+        item['sides'].add(r['side'])
+        item['uid'] = r.get('player_uid') or ''
+        item['heroes_str'] = '+'.join(str(hero_id) for hero_id in hero_ids)
+        item['hero_stars'] = [
+            max(item['hero_stars'][index], int(r.get(f'hero{index + 1}_star') or 0))
+            for index in range(3)
+        ]
+        item['max_troops'] = max(item['max_troops'], int(r.get('max_troops') or 0))
+        current_stamp = (int(r.get('latest_battle_time') or 0), int(r.get('latest_battle_id') or 0))
+        if current_stamp > (item['max_time'], item['max_battle_id']):
+            item['max_time'], item['max_battle_id'] = current_stamp
+            item['union'] = r.get('player_union') or ''
+            item['clan_name'] = r.get('clan_name') or ''
+            item['skills'] = parse_skills(
+                r.get('all_skill_info'), [1, 2, 3] if r['side'] == 'atk' else [6, 5, 4]
+            )
+
+    data = []
+    for (player_name, _uid, _h1, _h2, _h3), item in merged.items():
+        count = item['cnt']
+        data.append({
+            'player_name': player_name,
+            'uid': item['uid'],
+            'union': item['union'],
+            'clan_name': item['clan_name'],
+            'side': 'both' if len(item['sides']) == 2 else next(iter(item['sides']), ''),
+            'heroes_str': item['heroes_str'],
+            'hero_stars': item['hero_stars'],
+            'skills': item['skills'],
+            'max_troops': item['max_troops'],
+            'has_troops': 1 if item['max_troops'] > 0 else 0,
+            'cnt': count,
+            'wins': item['wins'],
+            'draws': item['draws'],
+            'win_rate': round((item['wins'] + item['draws'] * 0.5) * 100 / count, 1) if count else 0,
+        })
+    data.sort(key=lambda item: (item['player_name'], -item['cnt']))
+    return data[:limit]
+
+
+# ===== 玩家队伍统计 =====
 @app.route('/api/player_teams_stats')
 def api_player_teams_stats():
     player = request.args.get('player', '')
@@ -2510,7 +2629,7 @@ def api_player_battle_teams():
     with _db_lock:
         _db_path = _current_db_path
     _pid = get_current_pid()
-    cache_key = f'{_pid}|{_db_path}|{player}|{union}|{side}'
+    cache_key = f'v2|{_pid}|{_db_path}|{player}|{union}|{side}'
     now = _time.time()
     if (not debug_mode) and cache_key in cache_data:
         entry = cache_data[cache_key]
@@ -2518,6 +2637,30 @@ def api_player_battle_teams():
             return jsonify(entry['result'])
 
     conn = get_db()
+    materialized = _read_materialized_player_teams(conn, player, union, side)
+    if materialized:
+        conn.close()
+        cache_data[cache_key] = {'ts': now, 'result': materialized}
+        if debug_mode:
+            return jsonify({
+                'debug_count': {
+                    'stage1_rows': len(materialized),
+                    'stage1_groups': len(materialized),
+                    'final_rows': len(materialized),
+                    'used_fallback': False,
+                    'cache_hit': False,
+                    'materialized': True,
+                },
+                'debug_ctx': {
+                    'db_path': _db_path,
+                    'profile_id': _pid,
+                    'side': side,
+                    'player': player,
+                    'union': union,
+                },
+                'data': materialized,
+            })
+        return jsonify(materialized)
     bv_cols = get_bv2_cols(conn)
 
     # 先按 NPC 过滤查询；若结果为空，再回退为不过滤（用于排查 is_npc/isnpc 字段不一致问题）
@@ -2566,12 +2709,38 @@ def api_player_battle_teams():
             cache_data[cache_key] = {'ts': now, 'result': []}
             return jsonify([])
 
+    # 只读取聚合实际使用的字段，避免把战报中的大型扩展字段全部搬入 Python
+    def _team_col(name, default):
+        return name if name in bv_cols else f'{default} AS {name}'
+
+    team_select = [
+        _team_col('battle_id', '0'),
+        _team_col('result', '0'),
+        _team_col('atk_name', "''"),
+        _team_col('atk_uid', "''"),
+        _team_col('atk_union', "''"),
+        _team_col('attack_clan_name', "''"),
+        _team_col('def_name', "''"),
+        _team_col('def_union', "''"),
+        _team_col('defend_clan_name', "''"),
+        _team_col('attack_all_hero_info', "''"),
+        _team_col('defend_all_hero_info', "''"),
+        _team_col('all_skill_info', "''"),
+        _team_col('atk_advance', "''"),
+        _team_col('def_advance', "''"),
+        _team_col('attack_hp', '0'),
+    ]
+    for _side in ('atk', 'def'):
+        for _position in (1, 2, 3):
+            team_select.append(_team_col(f'{_side}_hero{_position}_id', '0'))
+    team_select_sql = ','.join(team_select)
+
     # 查询这些玩家的所有战报
     if target_players:
         # 构建 IN 查询
         placeholders = ','.join(['?'] * len(target_players))
         rows = conn.execute(f'''
-            SELECT *
+            SELECT {team_select_sql}
             FROM battles_v2
             WHERE {where}
               AND (atk_name IN ({placeholders}) OR def_name IN ({placeholders}))
@@ -2581,7 +2750,7 @@ def api_player_battle_teams():
     else:
         # 没有玩家/联盟过滤，返回所有
         rows = conn.execute(f'''
-            SELECT *
+            SELECT {team_select_sql}
             FROM battles_v2
             WHERE {where}
             ORDER BY battle_id DESC
@@ -2593,7 +2762,7 @@ def api_player_battle_teams():
         if target_players:
             placeholders = ','.join(['?'] * len(target_players))
             rows = conn.execute(f'''
-                SELECT *
+                SELECT {team_select_sql}
                 FROM battles_v2
                 WHERE {where_fallback}
                   AND (atk_name IN ({placeholders}) OR def_name IN ({placeholders}))
@@ -2602,7 +2771,7 @@ def api_player_battle_teams():
             ''', list(target_players) * 2).fetchall()
         else:
             rows = conn.execute(f'''
-                SELECT *
+                SELECT {team_select_sql}
                 FROM battles_v2
                 WHERE {where_fallback}
                 ORDER BY battle_id DESC

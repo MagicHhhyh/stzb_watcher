@@ -10,6 +10,7 @@ from collections import deque
 from world_scene.parser import WorldSceneAssembler, parse_world_scene_packet
 from world_scene.state_store import WorldStateStore
 from world_scene.store import WorldSceneStore
+from battle_lineup_index import ensure_schema as ensure_lineup_index_schema, upsert_battle as upsert_lineup_index
 
 APP_DIR      = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 RESOURCE_DIR = getattr(sys, '_MEIPASS', APP_DIR)
@@ -1263,14 +1264,169 @@ def parse_battle_0a(data, fpath):
     return results
 
 
+def _meaningful_battle_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _replace_battle_heroes_if_more_complete(conn, battle_id, side, heroes, has_star):
+    incoming = [hero for hero in heroes if int(hero.get('hero_id', 0) or 0) > 0]
+    if not incoming:
+        return False
+    existing_count = conn.execute(
+        'SELECT COUNT(*) FROM battle_heroes WHERE battle_id=? AND side=? AND hero_id>0',
+        (battle_id, side),
+    ).fetchone()[0]
+    if len(incoming) <= existing_count:
+        return False
+    conn.execute(
+        'DELETE FROM battle_heroes WHERE battle_id=? AND side=?',
+        (battle_id, side),
+    )
+    for position, hero in enumerate(incoming):
+        if has_star:
+            conn.execute(
+                '''
+                INSERT INTO battle_heroes (
+                    battle_id, side, pos, hero_id, hero_name, level, max_hp,
+                    remain_hp, damage_taken, star
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                ''',
+                (
+                    battle_id, side, position, hero['hero_id'], hero['hero_name'],
+                    hero['level'], hero['max_hp'], hero['remain_hp'],
+                    hero['damage_taken'], hero.get('star', 0),
+                ),
+            )
+        else:
+            conn.execute(
+                '''
+                INSERT INTO battle_heroes (
+                    battle_id, side, pos, hero_id, hero_name, level, max_hp,
+                    remain_hp, damage_taken
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ''',
+                (
+                    battle_id, side, position, hero['hero_id'], hero['hero_name'],
+                    hero['level'], hero['max_hp'], hero['remain_hp'],
+                    hero['damage_taken'],
+                ),
+            )
+    return True
+
+
+def _merge_existing_battle_0a(conn, existing, b, db_cols):
+    existing = dict(existing)
+    updates = {}
+    for col, key in _BATTLE_0A_FIELDS:
+        if col not in db_cols or key not in b:
+            continue
+        old_value = existing[col]
+        new_value = b[key]
+        if not _meaningful_battle_value(old_value) and _meaningful_battle_value(new_value):
+            updates[col] = new_value
+    for col, key in (
+        ('atk_team_id', 'atk_team_id'),
+        ('def_team_id', 'def_team_id'),
+    ):
+        if col not in db_cols:
+            continue
+        new_value = int(b.get(key, 0) or 0)
+        if not _meaningful_battle_value(existing[col]) and new_value:
+            updates[col] = new_value
+    if updates:
+        assignments = ','.join(f'{col}=?' for col in updates)
+        conn.execute(
+            f'UPDATE battles_v2 SET {assignments} WHERE battle_id=?',
+            list(updates.values()) + [b['battle_id']],
+        )
+    return bool(updates)
+
+
+def _canonical_battle_for_lineup_index(conn, battle_id):
+    columns = {
+        row[1] for row in conn.execute(
+            'PRAGMA table_info(battles_v2)'
+        ).fetchall()
+    }
+    select = ['battle_id']
+    for name in ('time', 'time_str', 'result', 'all_skill_info', 'atk_name', 'def_name',
+                 'atk_uid', 'atk_union', 'def_union', 'attack_clan_name',
+                 'defend_clan_name', 'attack_hp', 'is_npc', 'isnpc',
+                 'atk_team_id', 'def_team_id'):
+        select.append(name if name in columns else ("''" if name.endswith(('_str', 'info', 'name', 'uid', 'union')) else '0') + f' AS {name}')
+    for side in ('atk', 'def'):
+        for position in (1, 2, 3):
+            for suffix in ('id', 'level', 'star'):
+                name = f'{side}_hero{position}_{suffix}'
+                select.append(name if name in columns else f'0 AS {name}')
+    cursor = conn.execute(
+        f"SELECT {','.join(select)} FROM battles_v2 WHERE battle_id=?",
+        (battle_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    battle = dict(zip((item[0] for item in cursor.description), row))
+    for side in ('atk', 'def'):
+        prefix = side
+        heroes = []
+        hero_cursor = conn.execute(
+            '''SELECT pos, hero_id, level, star FROM battle_heroes
+               WHERE battle_id=? AND side=? AND hero_id>0 ORDER BY pos''',
+            (battle_id, side),
+        )
+        hero_rows = hero_cursor.fetchall()
+        hero_columns = [item[0] for item in hero_cursor.description]
+        for hero in hero_rows[:3]:
+            heroes.append(dict(zip(hero_columns, hero)))
+        battle[f'{prefix}_heroes'] = heroes
+    return battle
+
+
+def _refresh_lineup_index(conn, battle_id):
+    battle = _canonical_battle_for_lineup_index(conn, battle_id)
+    if battle is not None:
+        ensure_lineup_index_schema(conn)
+        upsert_lineup_index(conn, battle)
+
+
 def upsert_battle_0a(conn, b):
     """将 0000000a 战报写入 battles_v2 及相关表（照搬 stzbHelper Report struct 全字段）"""
     ensure_battles_v2_team_columns(conn)
-    exists = conn.execute('SELECT 1 FROM battles_v2 WHERE battle_id=?', (b['battle_id'],)).fetchone()
-    if exists:
+    db_cols = {r[1] for r in conn.execute('PRAGMA table_info(battles_v2)').fetchall()}
+    existing_cursor = conn.execute(
+        'SELECT * FROM battles_v2 WHERE battle_id=?',
+        (b['battle_id'],),
+    )
+    existing_row = existing_cursor.fetchone()
+    existing = (
+        dict(zip((column[0] for column in existing_cursor.description), existing_row))
+        if existing_row is not None
+        else None
+    )
+    if existing:
+        changed = _merge_existing_battle_0a(conn, existing, b, db_cols)
+        bh_cols = {
+            r[1] for r in conn.execute('PRAGMA table_info(battle_heroes)').fetchall()
+        }
+        has_star = 'star' in bh_cols
+        changed = _replace_battle_heroes_if_more_complete(
+            conn, b['battle_id'], 'atk', b['atk_heroes'], has_star
+        ) or changed
+        changed = _replace_battle_heroes_if_more_complete(
+            conn, b['battle_id'], 'def', b['def_heroes'], has_star
+        ) or changed
+        _refresh_lineup_index(conn, b['battle_id'])
+        conn.commit()
         return False
     # 用字段映射表动态构建 INSERT，彻底避免列名/key 不一致
-    db_cols = {r[1] for r in conn.execute('PRAGMA table_info(battles_v2)').fetchall()}
     seen = set()
     cols, vals = [], []
     for col, key in _BATTLE_0A_FIELDS:
@@ -1365,6 +1521,7 @@ def upsert_battle_0a(conn, b):
                 VALUES (?,?,?,?,?,?,?,?,?)
             ''', (b['battle_id'], 'def', i, h['hero_id'], h['hero_name'],
                   h['level'], h['max_hp'], h['remain_hp'], h['damage_taken']))
+    _refresh_lineup_index(conn, b['battle_id'])
     conn.commit()
     return True
 

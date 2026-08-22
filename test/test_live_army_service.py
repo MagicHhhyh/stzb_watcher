@@ -545,7 +545,7 @@ class LiveArmyLineupTest(LiveArmyTestCase):
             [hero["id"] for hero in lineup["heroes"]],
         )
 
-    def test_latest_invalid_report_falls_back_to_latest_valid_same_army(self):
+    def test_incomplete_same_army_reports_are_not_exact_lineups(self):
         insert_army(self.connection, army_id=77)
         insert_battle(
             self.connection,
@@ -564,10 +564,63 @@ class LiveArmyLineupTest(LiveArmyTestCase):
 
         lineup = LiveArmyService(self.connection).snapshot()["current"][0]["lineup"]
 
-        self.assertEqual(1, lineup["battleId"])
-        self.assertEqual("exact", lineup["status"])
+        self.assertEqual("unknown", lineup["status"])
         self.assertFalse(lineup["complete"])
-        self.assertEqual(2, len(lineup["heroes"]))
+        self.assertEqual(0, lineup["battleId"])
+        self.assertEqual([], lineup["heroes"])
+
+    def test_infers_recent_complete_lineup_for_same_owner(self):
+        insert_army(self.connection, army_id=814501, user_id=14455)
+        insert_battle(
+            self.connection,
+            battle_id=31,
+            time=NOW_MS // 1000 - 60,
+            atk_team_id=999999,
+            atk_name="玩家14455",
+            atk_hero_ids=(100705, 100707, 100101),
+        )
+
+        snapshot = LiveArmyService(
+            self.connection,
+            now_ms=NOW_MS,
+        ).snapshot()
+        lineup = snapshot["current"][0]["lineup"]
+
+        self.assertEqual("inferred", lineup["status"])
+        self.assertTrue(lineup["complete"])
+        self.assertEqual(31, lineup["battleId"])
+        self.assertEqual("medium", lineup["confidence"])
+        self.assertEqual(1, len(lineup.get("lineupCandidates", [])))
+        self.assertEqual(1, lineup["lineupCandidates"][0]["rank"])
+        self.assertEqual(1, snapshot["summary"]["inferredLineups"])
+        self.assertEqual(0, snapshot["summary"]["exactLineups"])
+
+    def test_exact_lineup_wins_over_recent_same_owner_candidate(self):
+        insert_army(self.connection, army_id=814501, user_id=14455)
+        insert_battle(
+            self.connection,
+            battle_id=32,
+            time=NOW_MS // 1000 - 60,
+            atk_team_id=999999,
+            atk_name="玩家14455",
+            atk_hero_ids=(100705, 100707, 100101),
+        )
+        insert_battle(
+            self.connection,
+            battle_id=33,
+            time=NOW_MS // 1000 - 120,
+            atk_team_id=814501,
+            atk_name="其他玩家",
+            atk_hero_ids=(100013, 100649, 100023),
+        )
+
+        lineup = LiveArmyService(
+            self.connection,
+            now_ms=NOW_MS,
+        ).snapshot()["current"][0]["lineup"]
+
+        self.assertEqual("exact", lineup["status"])
+        self.assertEqual(33, lineup["battleId"])
 
     def test_no_same_army_report_is_unknown_without_player_fallback(self):
         insert_army(self.connection, army_id=814501, user_id=14455)
@@ -595,6 +648,47 @@ class LiveArmyLineupTest(LiveArmyTestCase):
             },
             lineup,
         )
+
+    def test_infers_multiple_candidates_for_same_owner(self):
+        insert_army(self.connection, army_id=814501, user_id=14455)
+        insert_battle(
+            self.connection,
+            battle_id=40,
+            time=NOW_MS // 1000 - 50,
+            atk_team_id=999991,
+            atk_name="玩家14455",
+            atk_hero_ids=(100705, 100707, 100101),
+        )
+        insert_battle(
+            self.connection,
+            battle_id=41,
+            time=NOW_MS // 1000 - 80,
+            atk_team_id=999992,
+            atk_name="玩家14455",
+            atk_hero_ids=(100013, 100649, 100023),
+        )
+        insert_battle(
+            self.connection,
+            battle_id=42,
+            time=NOW_MS // 1000 - 120,
+            def_team_id=999993,
+            def_name="玩家14455",
+            def_hero_ids=(100027, 100016, 100033),
+        )
+
+        lineup = LiveArmyService(
+            self.connection,
+            now_ms=NOW_MS,
+        ).snapshot()["current"][0]["lineup"]
+
+        self.assertEqual("inferred", lineup["status"])
+        self.assertEqual(3, len(lineup.get("lineupCandidates", [])))
+        self.assertEqual(1, lineup["lineupCandidates"][0]["rank"])
+        self.assertEqual(40, lineup["lineupCandidates"][0]["battleId"])
+        self.assertEqual(2, lineup["lineupCandidates"][1]["rank"])
+        self.assertEqual(41, lineup["lineupCandidates"][1]["battleId"])
+        self.assertEqual(3, lineup["lineupCandidates"][2]["rank"])
+        self.assertEqual(42, lineup["lineupCandidates"][2]["battleId"])
 
 
 class LiveArmyOfflineTest(LiveArmyTestCase):
